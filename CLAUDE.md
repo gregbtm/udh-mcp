@@ -128,15 +128,9 @@ it exists) → Portainer redeploys from `matrix-homelab/stacks/udh-mcp/`.
 
 **Deployed and verified end-to-end (2026-10-07/2026-10-08):**
 1. Portainer stack `udh-mcp` (Stack ID 678), `network_mode: host`,
-   running `ghcr.io/gregbtm/udh-mcp:latest` on host port **12021** —
-   ⚠️ **this differs from the `12020` recorded in `matrix-homelab`'s
-   `stacks/udh-mcp/stack.yaml`/`docker-compose.yml` at the time those
-   files were written; one of the two needs reconciling** (either the
-   live stack's `UDH_MCP_PORT` env var was changed during deployment to
-   dodge a second collision, or the repo file is simply stale — check
-   `syno_portainer stack_status stack=udh-mcp` against the repo before
-   assuming either, then fix whichever is wrong so the next redeploy
-   from git doesn't silently move the port back).
+   running `ghcr.io/gregbtm/udh-mcp:latest` on host port **12021** (reconciled
+   and aligned with `matrix-homelab`'s `stacks/udh-mcp/stack.yaml` and
+   `docker-compose.yml`, both specifying port 12021).
 2. `UDH_AUTH_TOKEN` and `UDH_AUTH_TOKEN_READONLY` minted and stored in
    Infisical under folder `udh-mcp`.
 3. `WF07_AUTH_TOKEN`/`WF14_AUTH_TOKEN` confirmed identical to
