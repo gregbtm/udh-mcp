@@ -67,13 +67,12 @@ a single read-only webhook, dispatched on a `kind` field:
 - `list_quarantined` — `doc_registry` rows with `quarantine_status` set.
 - `recent_operations` — `operation_log` rows, optionally filtered by `doc_id`.
 
-**Not yet imported or exercised against a live n8n instance** — same
-discipline as every UDH workflow file built without live access in this
-project (see `matrix-homelab/docs/udh/15-settings-dashboard-state-of-play.md`
-for the precedent: structurally verified, behaviorally unconfirmed until
-a live session imports it and runs each `kind` once against real data).
-`udh_query` reports a clean connection error rather than a confusing one
-until `WF16_URL`/`WF16_AUTH_TOKEN` are set.
+**Imported and verified live 2026-10-08.** n8n workflow id `4jc20pd5U0p8ust2`,
+active, authenticated via the "UDH Query Auth Header" credential
+(`NGwaSRbxc1EgI0ow`). All 5 query kinds (`get_document`,
+`search_documents`, `list_conflicts`, `list_quarantined`,
+`recent_operations`) confirmed against real data. `WF16_URL`/
+`WF16_AUTH_TOKEN` are wired into the live `udh-mcp` stack.
 
 ## Auth: scoped multi-token
 
@@ -127,21 +126,28 @@ push to `main` → `docker-publish.yml` tests, builds `linux/amd64`, pushes
 `ghcr.io/<owner>/udh-mcp:latest` → POSTs `PORTAINER_WEBHOOK_UDH_MCP` (once
 it exists) → Portainer redeploys from `matrix-homelab/stacks/udh-mcp/`.
 
-**Not yet deployed.** First live-session steps, in order:
-1. Create the `udh-mcp` Docker network / directories if needed, then the
-   Portainer stack from `matrix-homelab/stacks/udh-mcp/` (`syno_portainer
-   create_stack`).
-2. Mint `UDH_AUTH_TOKEN` and store it in Infisical (`syno_config
-   create_scoped_token`-style generation, or any random 32-byte value).
-3. Set `WF07_URL`/`WF07_AUTH_TOKEN` and `WF14_URL`/`WF14_AUTH_TOKEN` to
-   the **same values** `udh-dashboard`'s stack already uses (not new
-   secrets) — confirm via `syno_portainer compare_env` that they match.
-4. Import `wf16_udh_query_api.json` into n8n, wire its webhook auth
-   credential, and only then set `WF16_URL`/`WF16_AUTH_TOKEN`.
-5. `enable_webhook` on the new stack, register `PORTAINER_WEBHOOK_UDH_MCP`
-   as a GitHub secret.
-6. Add the Claude connector (`claude mcp add --transport http`), reusing
-   the `udh-mcp-facts` skill for operational knowledge from then on.
+**Deployed and verified end-to-end (2026-10-07/2026-10-08):**
+1. Portainer stack `udh-mcp` (Stack ID 678), `network_mode: host`,
+   running `ghcr.io/gregbtm/udh-mcp:latest` on host port **12021** —
+   ⚠️ **this differs from the `12020` recorded in `matrix-homelab`'s
+   `stacks/udh-mcp/stack.yaml`/`docker-compose.yml` at the time those
+   files were written; one of the two needs reconciling** (either the
+   live stack's `UDH_MCP_PORT` env var was changed during deployment to
+   dodge a second collision, or the repo file is simply stale — check
+   `syno_portainer stack_status stack=udh-mcp` against the repo before
+   assuming either, then fix whichever is wrong so the next redeploy
+   from git doesn't silently move the port back).
+2. `UDH_AUTH_TOKEN` and `UDH_AUTH_TOKEN_READONLY` minted and stored in
+   Infisical under folder `udh-mcp`.
+3. `WF07_AUTH_TOKEN`/`WF14_AUTH_TOKEN` confirmed identical to
+   `udh-dashboard`'s stack env via `syno_portainer compare_env`.
+4. `wf16_udh_query_api.json` imported into n8n (workflow id
+   `4jc20pd5U0p8ust2`), active, all 5 query kinds verified against real
+   data — see the WF-16 section above.
+5. Portainer GitOps webhook enabled (`ForcePullImage=true`) and
+   registered as GitHub secret `PORTAINER_WEBHOOK_UDH_MCP`.
+6. Claude connector active at `https://udh.nasmatrix.app/mcp`, bearer
+   auth `UDH_AUTH_TOKEN`.
 
 ## Known gaps / where this goes next
 
