@@ -142,3 +142,13 @@ it exists) → Portainer redeploys from `matrix-homelab/stacks/udh-mcp/`.
    as a GitHub secret.
 6. Add the Claude connector (`claude mcp add --transport http`), reusing
    the `udh-mcp-facts` skill for operational knowledge from then on.
+
+## Known gaps / where this goes next
+
+See `ROADMAP.md` for the full, detailed backlog — produced by reviewing
+every UDH workflow (WF-01 through WF-16) against this server's current
+7-tool surface before anything here was deployed. Short version: no tool
+can read actual document content (only registry metadata), WF-08/WF-11
+(adapter health, integrity checks) have no external trigger at all, and
+`hub_config`/`target_config` are read-only through MCP today. Nothing in
+that file is built yet.
