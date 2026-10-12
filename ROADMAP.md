@@ -175,6 +175,25 @@ that actually tune how aggressively or cautiously UDH behaves — can only
 be changed by hand-editing the n8n Data Table UI directly, invisible to
 any MCP client and to any audit trail this server keeps.
 
+**Update 2026-10-12: the n8n prerequisite below is now done.**
+`wf07_adhoc_dispatch.json` gained real `update_hub_config`/
+`update_target_config` actions (Guard -> per-field route -> dataTable
+update -> operation_log entry, same pattern as every other action in
+that workflow) -- 14 of hub_config's 15 fields and 16 of target_config's
+documented fields, each validated against an allowlist before any write.
+Wired into `apps/udh-dashboard`'s Settings page (a new, real "System
+Parameters (hub_config -- live)" card) and `wf07_client.py` in the same
+session. Structurally verified (valid JSON, every connection resolves,
+every new Guard node's JS passes `node --check`, the dashboard's own
+smoke test boots and hits `/settings` with no exception) but **not yet
+confirmed against a live n8n/NAS instance** -- same "wired, not yet
+live-tested" status this ROADMAP's other items carry. This was found and
+fixed from `matrix-homelab`, not from this repo, since it's n8n-workflow
+and dashboard-app work, not udh-mcp server code -- but it directly
+unblocks the two items below: `udh_config`/`udh_targets` field setters
+can now be built as thin wrappers over real, existing WF-07 actions
+instead of needing new n8n work first. Neither tool is built yet.
+
 ### C1. `udh_config` (new tool) — hub_config field setters
 - `get()` — already available via `udh_dashboard`, but add a direct
   path so a caller doesn't need the whole dashboard payload just to read
@@ -211,11 +230,12 @@ Today: only `inbound_enabled`/`outbound_enabled`. Missing, all real
 if validation needs to differ per field (e.g. `conflict_action` has a
 fixed enum, `poll_interval_mins` just needs to be a positive integer).
 
-**n8n work needed:** both C1 and C2 need new WF-07 actions (or a single
-generic `set_hub_config`/`set_target_config` action each) — these are
-n8n changes, not just udh-mcp changes, and not small ones: every field
-touched needs its own validation on the n8n side too, matching WF-07's
-existing per-action guard-node pattern.
+**n8n work needed: done as of 2026-10-12** (see the update note at the
+top of this section) — `update_hub_config`/`update_target_config` exist
+in `wf07_adhoc_dispatch.json` now, each field validated by its own Guard
+node, matching WF-07's existing per-action pattern exactly. What's left
+for C1/C2 is purely udh-mcp-side: add the `udh_config`/richer
+`udh_targets` tool surface in this repo that calls them.
 
 ---
 
