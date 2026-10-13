@@ -21,6 +21,7 @@ import core  # noqa: E402
 EXPECTED_TOOLS = {
     "udh_dashboard", "udh_query", "udh_sync", "udh_targets",
     "udh_conflicts", "udh_lifecycle", "udh_control",
+    "udh_health", "udh_config", "udh_templates",
 }
 
 failed = []
@@ -264,10 +265,128 @@ async def main() -> None:
                 server.QueryIn(kind="get_document", doc_id="nope"), _FakeCtx())
             check("udh_query surfaces a WF-16 {'error': ...} body as a failure",
                   "doc not found" in r)
+
+            r = await server.udh_query(server.QueryIn(kind="search_fulltext"), _FakeCtx())
+            check("udh_query refuses search_fulltext with no query, before ever calling WF-16",
+                  "query" in r.lower() and fake.calls["posts"][-1][2].get("kind") != "search_fulltext")
+
+            fake.post_resp = _Resp(200, {"found": True, "doc_id": "d1", "content": "# Doc\n\nhello"})
+            r = await server.udh_query(
+                server.QueryIn(kind="get_content", doc_id="d1"), _FakeCtx())
+            check("udh_query posts kind=get_content with doc_id and surfaces real content",
+                  fake.calls["posts"][-1][2] == {"kind": "get_content", "doc_id": "d1", "limit": 50}
+                  and "hello" in r)
+
+            fake.post_resp = _Resp(200, {"count": 1, "documents": [{"doc_id": "d1", "title": "T"}], "engine": "meilisearch"})
+            r = await server.udh_query(
+                server.QueryIn(kind="search_fulltext", query="litigation"), _FakeCtx())
+            check("udh_query posts kind=search_fulltext with query",
+                  fake.calls["posts"][-1][2]["kind"] == "search_fulltext"
+                  and fake.calls["posts"][-1][2]["query"] == "litigation")
         finally:
             core.httpx = _oh
     finally:
         auth_context_var.reset(read_ctx)
+
+    # ---- udh_health / udh_config / udh_templates (added 2026-10-13) ----
+    restricted = ctx_with_scopes("read")  # has read, not sync
+    try:
+        r = await server.udh_health(server.HealthIn(action="check_health", confirm=True), _FakeCtx())
+        check("udh_health refuses a token without 'sync' scope",
+              "sync" in r.lower() and "scoped" in r.lower())
+        r = await server.udh_config(server.ConfigIn(action="update_hub_config", field="dry_run", value=True, confirm=True), _FakeCtx())
+        check("udh_config refuses a token without 'sync' scope",
+              "sync" in r.lower() and "scoped" in r.lower())
+        r = await server.udh_templates(server.TemplatesIn(action="list_templates"), _FakeCtx())
+        check("udh_templates refuses a token without 'sync' scope",
+              "sync" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted)
+
+    sync_ctx = ctx_with_scopes("sync")
+    try:
+        fake = _FakeHTTP()
+
+        class _Shim4:
+            AsyncClient = staticmethod(lambda *a, **k: fake)
+        _oh = core.httpx
+        core.httpx = _Shim4
+        core.WF07_URL = "https://n8n.test/webhook/dispatch"
+        core.WF07_AUTH_TOKEN = "wf07-token"
+        try:
+            r = await server.udh_config(
+                server.ConfigIn(action="update_target_config", field="enabled", value=False, confirm=True),
+                _FakeCtx())
+            check("udh_config refuses update_target_config without target_id before ever dispatching",
+                  "target_id" in r.lower() and fake.calls["posts"] == [])
+
+            r = await server.udh_config(
+                server.ConfigIn(action="update_target_config", target_id="trilium",
+                                 field="enabled", value=False, confirm=True), _FakeCtx())
+            check("udh_config dispatches update_target_config with field/value/target_id",
+                  fake.calls["posts"][-1][2] == {"action": "update_target_config",
+                                                  "field": "enabled", "value": False,
+                                                  "target_id": "trilium"})
+
+            fake.calls["posts"].clear()
+            r = await server.udh_health(
+                server.HealthIn(action="check_integrity", confirm=False, case_folder="EP"), _FakeCtx())
+            check("udh_health confirm=false previews without calling WF-07",
+                  "confirm=true" in r and fake.calls["posts"] == [])
+
+            r = await server.udh_health(
+                server.HealthIn(action="check_integrity", confirm=True, case_folder="EP"), _FakeCtx())
+            check("udh_health dispatches check_integrity with case_folder",
+                  fake.calls["posts"][-1][2] == {"action": "check_integrity", "case_folder": "EP"})
+
+            fake.calls["posts"].clear()
+            r = await server.udh_templates(server.TemplatesIn(action="list_templates"), _FakeCtx())
+            check("udh_templates list_templates dispatches with no confirm needed",
+                  fake.calls["posts"][-1][2] == {"action": "list_templates"})
+
+            fake.calls["posts"].clear()
+            r = await server.udh_templates(
+                server.TemplatesIn(action="create_template", name="Default", confirm=False), _FakeCtx())
+            check("udh_templates create_template confirm=false previews without calling WF-07",
+                  "confirm=true" in r and fake.calls["posts"] == [])
+
+            r = await server.udh_templates(
+                server.TemplatesIn(action="delete_template", template_id="tmpl-1", confirm=True), _FakeCtx())
+            check("udh_templates delete_template sends confirm=true in the WF-07 payload itself",
+                  fake.calls["posts"][-1][2] == {"action": "delete_template",
+                                                  "template_id": "tmpl-1", "confirm": True})
+
+            fake.calls["posts"].clear()
+            r = await server.udh_lifecycle(
+                server.LifecycleIn(action="purge_ingested", confirm=True,
+                                   payload={"target_id": "trilium"}), _FakeCtx())
+            check("udh_lifecycle accepts purge_ingested (needs admin, tested separately below)",
+                  "scoped" in r.lower() and "admin" in r.lower())
+        finally:
+            core.httpx = _oh
+    finally:
+        auth_context_var.reset(sync_ctx)
+
+    admin_ctx2 = ctx_with_scopes("admin")
+    try:
+        fake = _FakeHTTP()
+
+        class _Shim5:
+            AsyncClient = staticmethod(lambda *a, **k: fake)
+        _oh = core.httpx
+        core.httpx = _Shim5
+        core.WF07_URL = "https://n8n.test/webhook/dispatch"
+        core.WF07_AUTH_TOKEN = "wf07-token"
+        try:
+            r = await server.udh_lifecycle(
+                server.LifecycleIn(action="purge_ingested", confirm=True,
+                                   payload={"target_id": "trilium"}), _FakeCtx())
+            check("udh_lifecycle dispatches purge_ingested with admin scope + confirm",
+                  fake.calls["posts"][-1][2] == {"action": "purge_ingested", "target_id": "trilium"})
+        finally:
+            core.httpx = _oh
+    finally:
+        auth_context_var.reset(admin_ctx2)
 
     # ---- unconfigured env gives a clear message, not a crash ----
     unset_ctx = ctx_with_scopes("*")

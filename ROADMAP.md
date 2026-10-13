@@ -22,6 +22,19 @@ whose health/integrity checks can't be asked for is a system you can only
 find out is broken after the fact.
 
 ### A1. WF-08 adapter-health-check
+
+**STATUS 2026-10-13: the on-demand `check` half is done, differently than
+proposed below.** `udh_health(action='check_health')` now exists, routing
+through WF-07's own `check_health` action (added 2026-10-12 in
+matrix-homelab) to a real, executeWorkflowTrigger-based call into WF-08 —
+not the dedicated webhook + new `health_check_log` table this item
+originally proposed. `target_id` is accepted but not yet filtered
+server-side (every target is checked regardless). **`last_result()` (a
+cheap read of the most recent result without re-running it) is still not
+built** — there is still no persisted health-check result WF-14/WF-16 can
+read back; every call re-runs the check. Structurally verified only, not
+confirmed against a live n8n instance.
+
 **What it does:** per-target round-trip check — write a canary record to
 each adapter and confirm it comes back, catching an adapter that's
 silently broken (auth expired, API changed) before real documents start
@@ -44,6 +57,13 @@ results somewhere WF-14/WF-16 can read (a new `health_check_log` table,
 or reuse `operation_log` with `operation='health_check'`).
 
 ### A2. WF-11 integrity-check
+
+**STATUS 2026-10-13: same shape as A1.** `udh_health(action='check_integrity')`
+exists via WF-07's `check_integrity` action (also added 2026-10-12), an
+executeWorkflowTrigger into WF-11, not a dedicated webhook. `case_folder`
+accepted but not yet filtered server-side. `last_report()` still not
+built. Structurally verified only.
+
 **What it does:** weekly SHA-256 verification of every canonical file,
 flags orphaned target IDs.
 
@@ -145,6 +165,18 @@ udh-mcp today is blind to the one thing a document hub's whole job is to
 hold: the documents.
 
 ### B1. `udh_query(kind='get_content')`
+
+**DONE 2026-10-13.** Built exactly as proposed, plus a fix this gap had
+been masking: `apps/udh-dashboard`'s document viewer and conflicts diff
+studio had been calling this exact kind since before it existed, and
+silently substituted fabricated placeholder text for 100% of real calls
+instead of surfacing the failure — fixed the same day in matrix-homelab.
+Reads the canonical `.md` file via the same FileBrowser endpoint shape
+`wf02_enrich_document.json`'s own "Read Canonical" node uses. Executed
+directly (not just syntax-checked) for the found/not-found/row-exists-
+but-file-missing cases. Not yet confirmed against a live n8n/FileBrowser
+instance.
+
 Returns the canonical `.md` file's full body (front-matter + content) for
 a given `doc_id`, not just its registry row. The highest-value single
 addition in this entire document — almost every other improvement here
@@ -193,6 +225,15 @@ and dashboard-app work, not udh-mcp server code -- but it directly
 unblocks the two items below: `udh_config`/`udh_targets` field setters
 can now be built as thin wrappers over real, existing WF-07 actions
 instead of needing new n8n work first. Neither tool is built yet.
+
+**STATUS 2026-10-13: C1/C2's "set one field" half is done, as a single
+`udh_config` tool covering both hub_config and target_config (not split
+into separate "field setter" methods per field as sketched below) — see
+`CLAUDE.md`'s Tool Inventory. The "fetch current, merge, resend" batching
+these items originally proposed is NOT how it works: each call sets
+exactly one field, matching WF-07's own one-field-per-call Guard design
+rather than a batched multi-field set. `get()` is still not built as a
+dedicated path — `udh_dashboard` remains the only read.**
 
 ### C1. `udh_config` (new tool) — hub_config field setters
 - `get()` — already available via `udh_dashboard`, but add a direct
@@ -311,6 +352,10 @@ half of "retiring" a target -- it doesn't touch the `target_config` row
 itself, which is still exactly D4's gap. A future `udh_targets.retire()`
 could call `purge_ingested` first (with the caller's confirmation) and
 then clear/disable the row, rather than reinventing the deletion logic.
+
+**Now exposed here too (2026-10-13):** `udh_lifecycle(action='purge_ingested')`
+wraps this action, `admin`-gated same as this tool's other three actions.
+D4's actual gap (retiring the `target_config` row itself) is unchanged.
 
 ---
 

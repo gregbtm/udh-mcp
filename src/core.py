@@ -12,12 +12,13 @@ fails with a clear message rather than a confusing one if unset):
   WF14_URL, WF14_AUTH_TOKEN, WF14_AUTH_HEADER_NAME (default X-UDH-Dashboard-Token)
       -- udh_dashboard (read-only).
   WF16_URL, WF16_AUTH_TOKEN, WF16_AUTH_HEADER_NAME (default X-UDH-Query-Token)
-      -- udh_query (read-only). WF-16 is a NEW workflow this project adds
+      -- udh_query (read-only). WF-16 is a workflow this project added
       alongside WF-07/14 -- see n8n-workflows/wf16_udh_query_api.json in
-      matrix-homelab. Not yet imported/verified against a live n8n instance
-      as of this writing (same discipline as every other UDH workflow file
-      built without live access) -- udh_query reports a clear connection
-      error rather than a confusing one until it is.
+      matrix-homelab. Imported and verified live 2026-10-08 (workflow id
+      4jc20pd5U0p8ust2) -- see CLAUDE.md. get_content and search_fulltext
+      were added to it 2026-10-13 and are structurally verified only
+      (every new node's JS executed directly, not just syntax-checked;
+      not yet exercised against this specific live workflow import).
 """
 from __future__ import annotations
 
@@ -41,16 +42,32 @@ WF16_AUTH_HEADER_NAME = os.environ.get("WF16_AUTH_HEADER_NAME", "X-UDH-Query-Tok
 
 # WF-07's own Global Pause Gate node (matrix-homelab's n8n-workflows/
 # wf07_adhoc_dispatch.json VALID_ACTIONS list) -- keep in sync if that
-# list ever changes there.
+# list ever changes there. Synced 2026-10-13 to add thirteen actions added
+# to that list across 2026-10-12/13's matrix-homelab sessions: snapshot/
+# sync_outbound/backfill_trilium (pre-existing WF-09/WF-05b/WF-15
+# wrappers this server never exposed), update_hub_config/
+# update_target_config/check_health/check_integrity/purge_ingested (the
+# exact gap udh-mcp's own CLAUDE.md "Known gaps" section named), and
+# list_templates/create_template/update_template/delete_template/
+# set_default_template (new the same day, for the ingestion-templates
+# feature).
 DISPATCH_ACTIONS = [
     "publish", "ingest", "reenrich", "resolve_conflict", "rollback",
     "scan_drift", "confirm_delete", "scrape_url", "release_quarantine",
-    "set_global_pause", "set_target_enabled",
+    "set_global_pause", "set_target_enabled", "snapshot", "sync_outbound",
+    "backfill_trilium", "update_hub_config", "update_target_config",
+    "check_health", "check_integrity", "purge_ingested", "list_templates",
+    "create_template", "update_template", "delete_template",
+    "set_default_template",
 ]
 # Actions that restore, overwrite, or destroy existing state rather than
-# move data forward.
+# move data forward. purge_ingested added 2026-10-13 -- it permanently
+# deletes real documents from a target (matrix-homelab's
+# wf07_client.py's own purge_target_ingested() docstring: "THIS IS
+# IRREVERSIBLE from UDH's side"), the same destructive tier as
+# confirm_delete.
 DESTRUCTIVE_ACTIONS = {"rollback", "confirm_delete", "resolve_conflict",
-                        "release_quarantine"}
+                        "release_quarantine", "purge_ingested"}
 # Ungated at the WF-07 layer itself (UNGATED_ACTIONS) -- must keep working
 # even while hub_config.global_pause is true, so a paused system can still
 # be un-paused and a misbehaving target can still be disabled.
@@ -106,7 +123,8 @@ async def dashboard_data(timeout: float = 30.0) -> tuple:
 
 
 QUERY_KINDS = ["get_document", "search_documents", "list_conflicts",
-               "list_quarantined", "recent_operations"]
+               "list_quarantined", "recent_operations", "search_fulltext",
+               "get_content"]
 
 
 async def query(kind: str, params: Optional[dict] = None,

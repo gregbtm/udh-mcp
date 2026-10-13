@@ -22,17 +22,27 @@ one generic `action=` dispatcher. `syno_udh` is left as-is in the sibling
 repo; nothing here imports from or registers with it, mcphub, or any
 other MCP server.
 
-## Tool Inventory (7 tools)
+## Tool Inventory (10 tools)
+
+Expanded from 7 to 10 on 2026-10-13 -- the three new tools close exactly
+the gap this file's own "Known gaps" section had tracked (`check_health`/
+`check_integrity`/`update_hub_config`/`update_target_config`/
+`purge_ingested` existed server-side in matrix-homelab since 2026-10-12
+with nothing here exposing them), plus `udh_query` gained two kinds
+(`search_fulltext`, `get_content`) added to WF-16 the same day.
 
 | Tool | Backing workflow | Scope needed | Gating |
 |---|---|---|---|
 | `udh_dashboard` | WF-14 (read) | `read` | None — read-only |
-| `udh_query` | WF-16 (read, **new**) | `read` | None — read-only |
-| `udh_sync` | WF-07: publish/ingest/reenrich/scan_drift/scrape_url | `sync` | confirm=true |
+| `udh_query` | WF-16: get_document/search_documents/search_fulltext/get_content/list_conflicts/list_quarantined/recent_operations | `read` | None — read-only |
+| `udh_sync` | WF-07: publish/ingest/reenrich/scan_drift/scrape_url/snapshot/sync_outbound/backfill_trilium | `sync` | confirm=true |
 | `udh_targets` | WF-07: set_target_enabled | `sync` | confirm=true |
 | `udh_control` | WF-07: set_global_pause | `sync` | confirm=true |
+| `udh_health` | WF-07: check_health/check_integrity | `sync` | confirm=true + preview |
+| `udh_config` | WF-07: update_hub_config/update_target_config | `sync` | confirm=true + preview |
+| `udh_templates` | WF-07: list/create/update/delete/set_default_template | `sync` | confirm=true + preview (list_templates excepted) |
 | `udh_conflicts` | WF-07: resolve_conflict | `admin` | confirm=true + preview |
-| `udh_lifecycle` | WF-07: rollback/confirm_delete/release_quarantine | `admin` | confirm=true + preview |
+| `udh_lifecycle` | WF-07: rollback/confirm_delete/release_quarantine/purge_ingested | `admin` | confirm=true + preview |
 
 The `sync`/`admin` split mirrors `synology-proxy-mcp`'s own
 destructive-vs-additive tiering: `admin` is for actions that **restore,
@@ -69,10 +79,26 @@ a single read-only webhook, dispatched on a `kind` field:
 
 **Imported and verified live 2026-10-08.** n8n workflow id `4jc20pd5U0p8ust2`,
 active, authenticated via the "UDH Query Auth Header" credential
-(`NGwaSRbxc1EgI0ow`). All 5 query kinds (`get_document`,
+(`NGwaSRbxc1EgI0ow`). The original 5 query kinds (`get_document`,
 `search_documents`, `list_conflicts`, `list_quarantined`,
 `recent_operations`) confirmed against real data. `WF16_URL`/
 `WF16_AUTH_TOKEN` are wired into the live `udh-mcp` stack.
+
+**Two more kinds added 2026-10-13, structurally verified only (not yet
+re-imported/exercised against the live n8n instance above):**
+- `get_content` — the canonical `.md` file's actual text via FileBrowser
+  (same endpoint shape `wf02_enrich_document.json`'s own "Read Canonical"
+  node uses). Closes this server's own `ROADMAP.md` item B1, its
+  highest-priority named gap: an LLM operating UDH through this server
+  could not previously see a document's actual content, only its
+  registry metadata. Also fixes a real, separate bug this exposed:
+  `apps/udh-dashboard`'s document viewer and conflict diff studio had
+  been calling this exact `kind` since before it existed, silently
+  substituting fabricated placeholder text for every document opened
+  (fixed the same day in `matrix-homelab`).
+- `search_fulltext` — typo-tolerant ranked search via Meilisearch
+  (indexed post-publish documents only, a different set and shape from
+  `search_documents`' raw `doc_registry` rows).
 
 ## Auth: scoped multi-token
 
@@ -146,24 +172,26 @@ it exists) → Portainer redeploys from `matrix-homelab/stacks/udh-mcp/`.
 ## Known gaps / where this goes next
 
 See `ROADMAP.md` for the full, detailed backlog — produced by reviewing
-every UDH workflow (WF-01 through WF-16) against this server's current
-7-tool surface before anything here was deployed. Short version: no tool
-can read actual document content (only registry metadata). Nothing in
-that file is built *in this repo* yet, but three of its prerequisites
-were built from `matrix-homelab` instead (2026-10-12/13, for
-`apps/udh-dashboard`'s Settings page, not for this server's own tools):
-WF-08/WF-11 (adapter health, integrity checks) now have an on-demand
-`executeWorkflowTrigger` WF-07 can call; `hub_config`/`target_config`
-gained real `update_hub_config`/`update_target_config` WF-07 actions
-(C1/C2's n8n half); and a new `purge_ingested` action can delete
-documents UDH itself ingested into trilium/obsidian/paperless/affine/
-notion (D4's adjacent deletion mechanism, not target retirement itself;
-also fixed a real registry bug while extending to affine -- its outbound
-write had been discarding the AFFiNE document id instead of persisting
-it, so there was no reliable way to identify which AFFiNE doc to purge
-until that was fixed). Also added an early source-hash short-circuit to
-WF-02 so re-enrichment skips Docling/Claude entirely when the source is
-confirmed unchanged, rather than only skipping the final write as
-before. All structurally verified, none confirmed live. What's still
-missing here is purely udh-mcp-side: none of these are exposed as MCP
-tools yet.
+every UDH workflow (WF-01 through WF-16) against this server's original
+7-tool surface before anything here was deployed.
+
+**Closed 2026-10-13** (the gap this section used to describe as "purely
+udh-mcp-side... none of these are exposed as MCP tools yet"):
+`check_health`/`check_integrity` → `udh_health`; `update_hub_config`/
+`update_target_config` → `udh_config`; `purge_ingested` → added to
+`udh_lifecycle`. Plus `udh_query` gained `search_fulltext` and
+`get_content` (closing `ROADMAP.md` item B1, the document-content gap —
+"no tool can read actual document content" is no longer true), and a new
+`udh_templates` tool covers the same day's ingestion-template CRUD
+actions. All ten tools' scope gating, confirm-preview behavior, and
+payload construction are covered by `test_tool_registration.py` (33
+assertions). None of this is confirmed against the live n8n/udh-mcp
+deployment — the underlying n8n workflow changes themselves are also not
+yet re-imported there (see each action's own matrix-homelab commit for
+what's structurally-verified-only versus previously-confirmed-live).
+
+**Still open, per `ROADMAP.md`:** items A3-A6 (WF-09 snapshot already has
+a tool action now via `udh_sync`'s `snapshot`, but no `list()` of
+existing snapshots), B2 onward (content diffing, embeddings-based
+search beyond Meilisearch's keyword search, etc.) — see that file for
+the current full list.

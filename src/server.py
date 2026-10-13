@@ -3,34 +3,55 @@ Hub (UDH). Independent of synology-proxy-mcp and mcphub: this server holds
 its own credentials and talks directly to n8n's UDH webhooks (WF-07
 adhoc-dispatch, WF-14 dashboard-data, WF-16 query-api).
 
-Tool surface: 7 tools, decomposed by responsibility rather than one
+Tool surface: 10 tools, decomposed by responsibility rather than one
 mega-dispatcher (mirrors how syno_rules/syno_portainer/etc. are split by
-subsystem in synology-proxy-mcp, applied to UDH's own action set):
+subsystem in synology-proxy-mcp, applied to UDH's own action set).
+Expanded from 7 to 10 on 2026-10-13, closing the exact gap this file's
+own CLAUDE.md had tracked under "Known gaps" (check_health/
+check_integrity/update_hub_config/update_target_config/purge_ingested
+all existed server-side in matrix-homelab since 2026-10-12 with no MCP
+tool exposing them yet) plus two matrix-homelab actions added the same
+day (ingestion-template CRUD, Meilisearch full-text search):
 
   udh_dashboard   Read-only system snapshot (WF-14): hub_config,
                   target_config, recent operations, conflict queue.
   udh_query       Read-only document lookups (WF-16): get_document,
-                  search_documents, list_conflicts, list_quarantined,
-                  recent_operations. New capability this project adds --
-                  WF-14 only ever returns a fixed dashboard shape, not an
-                  arbitrary document lookup.
+                  search_documents, search_fulltext, get_content,
+                  list_conflicts, list_quarantined, recent_operations.
+                  New capability this project adds -- WF-14 only ever
+                  returns a fixed dashboard shape, not an arbitrary
+                  document lookup. get_content (2026-10-13) is the one
+                  this server's own ROADMAP.md names as its single
+                  highest-value gap (B1): the actual canonical document
+                  text, not just registry metadata.
   udh_sync        Day-to-day sync operations (WF-07): publish, ingest,
-                  reenrich, scan_drift, scrape_url.
+                  reenrich, scan_drift, scrape_url, snapshot,
+                  sync_outbound, backfill_trilium.
   udh_targets     Per-target control (WF-07): set_target_enabled.
   udh_conflicts   Conflict resolution (WF-07): resolve_conflict.
   udh_lifecycle   Restore/overwrite/destroy operations (WF-07): rollback,
-                  confirm_delete, release_quarantine.
+                  confirm_delete, release_quarantine, purge_ingested.
   udh_control     Emergency brake (WF-07): set_global_pause.
+  udh_health      On-demand health/integrity checks (WF-07): check_health,
+                  check_integrity.
+  udh_config      Hub/target configuration tuning (WF-07):
+                  update_hub_config, update_target_config.
+  udh_templates   Ingestion template CRUD (WF-07): list_templates,
+                  create_template, update_template, delete_template,
+                  set_default_template.
 
 Auth: scoped multi-token, same model as synology-proxy-mcp. UDH_AUTH_TOKEN
 is always full access (["*"]). Additional UDH_AUTH_TOKEN_<NAME> +
 UDH_AUTH_SCOPES_<NAME> (comma-separated: read, sync, admin) env vars mint
 narrower tokens. 'read' covers udh_dashboard/udh_query; 'sync' additionally
-covers udh_sync/udh_targets/udh_control (day-to-day, non-destructive);
-'admin' is required for udh_conflicts/udh_lifecycle (restore/overwrite/
-destroy). If UDH_AUTH_TOKEN is unset entirely, auth is disabled and every
-call is allowed -- matches synology-proxy-mcp's own documented behavior
-for a token-less deployment.
+covers udh_sync/udh_targets/udh_control/udh_health/udh_config/udh_templates
+(day-to-day, non-destructive -- none of these three new tools restore,
+overwrite, or destroy document data, only trigger a check or change future
+behavior); 'admin' is required for udh_conflicts/udh_lifecycle (restore/
+overwrite/destroy, including udh_lifecycle's new purge_ingested action --
+it permanently deletes real documents from a target). If UDH_AUTH_TOKEN is
+unset entirely, auth is disabled and every call is allowed -- matches
+synology-proxy-mcp's own documented behavior for a token-less deployment.
 
 HTTP: /status (GET, liveness + config presence, no secrets)
 Env:  UDH_PUBLIC_URL -- this server's own public base URL (informational).
@@ -234,15 +255,19 @@ class QueryIn(BaseModel):
     model_config = M
     kind: str = Field(..., description=(
         "get_document | search_documents | list_conflicts | "
-        "list_quarantined | recent_operations"))
+        "list_quarantined | recent_operations | search_fulltext | get_content"))
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
-    doc_id: Optional[str] = Field(None, description="get_document/recent_operations: the doc's id.")
-    source_path: Optional[str] = Field(None, description="get_document: the NAS source path (alternative to doc_id).")
+    doc_id: Optional[str] = Field(None, description="get_document/recent_operations/get_content: the doc's id.")
+    source_path: Optional[str] = Field(None, description="get_document/get_content: the NAS source path (alternative to doc_id).")
     case_folder: Optional[str] = Field(None, description="search_documents: filter by top-level case folder.")
     status_filter: Optional[str] = Field(None, description=(
         "search_documents: filter on any <target>_status column value "
         "(e.g. 'pending', 'error')."))
-    limit: int = Field(50, description="search_documents/list_*/recent_operations: max rows (default 50).")
+    limit: int = Field(50, description="search_documents/list_*/recent_operations/search_fulltext: max rows (default 50).")
+    query: Optional[str] = Field(None, description="search_fulltext (required): the free-text search string.")
+    document_type: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
+    sensitivity: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
+    folder: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
 
 
 @server.tool(name="udh_query", title="UDH Document & Conflict Query", annotations=RD)
@@ -258,6 +283,24 @@ async def udh_query(params: QueryIn, ctx: Context) -> str:
                            row including every <target>_status/_synced_at/
                            _etag column and the provenance chain.
       search_documents     case_folder=..., status_filter=..., limit=...
+                           Lists doc_registry rows directly (every
+                           ingested document, any processing state).
+      search_fulltext      query=... (required), optional document_type/
+                           sensitivity/folder facets, limit=... — real
+                           typo-tolerant ranked full-text search via
+                           Meilisearch (added 2026-10-13). Only covers
+                           documents that have actually been *published*
+                           (indexed post-WF-03) — not the same document
+                           set search_documents lists, and returns a
+                           different shape (Meilisearch's indexed fields,
+                           not raw doc_registry columns).
+      get_content          doc_id=... or source_path=... — the canonical
+                           .md file's actual text (front-matter + body),
+                           not just its registry metadata (added
+                           2026-10-13 — this is "B1" from ROADMAP.md, the
+                           single highest-value gap that list named: an
+                           LLM operating UDH through this server could not
+                           previously see a document's actual content).
       list_conflicts        Open conflict_queue rows needing resolution.
       list_quarantined       doc_registry rows with quarantine_status set.
       recent_operations     doc_id=... (optional) — operation_log entries,
@@ -269,10 +312,14 @@ async def udh_query(params: QueryIn, ctx: Context) -> str:
         return "This token isn't scoped for udh_query — needs 'read' (or '*')."
     if params.kind not in QUERY_KINDS:
         return f"Unknown kind '{params.kind}'. Kinds: {', '.join(QUERY_KINDS)}"
+    if params.kind == "search_fulltext" and not params.query:
+        return "search_fulltext requires 'query'."
     qparams = {k: v for k, v in {
         "doc_id": params.doc_id, "source_path": params.source_path,
         "case_folder": params.case_folder, "status_filter": params.status_filter,
-        "limit": params.limit,
+        "limit": params.limit, "query": params.query,
+        "document_type": params.document_type, "sensitivity": params.sensitivity,
+        "folder": params.folder,
     }.items() if v is not None}
     ok, text, data = await query(params.kind, qparams)
     return out(text, data, params.output) if ok else text
@@ -282,16 +329,21 @@ async def udh_query(params: QueryIn, ctx: Context) -> str:
 
 class SyncIn(BaseModel):
     model_config = M
-    action: str = Field(..., description="publish | ingest | reenrich | scan_drift | scrape_url")
+    action: str = Field(..., description=(
+        "publish | ingest | reenrich | scan_drift | scrape_url | snapshot | "
+        "sync_outbound | backfill_trilium"))
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required for every action here.")
     payload: Optional[dict] = Field(None, description=(
         "Action-specific fields, passed through verbatim to WF-07 alongside "
         "'action'. See matrix-homelab's n8n-udh-workflow-facts skill and "
-        "docs/udh/04-udh-architecture.md for each action's exact fields."))
+        "docs/udh/04-udh-architecture.md for each action's exact fields. "
+        "snapshot needs {'doc_id': ...}; sync_outbound and backfill_trilium "
+        "take no required fields."))
 
 
-_SYNC_ACTIONS = {"publish", "ingest", "reenrich", "scan_drift", "scrape_url"}
+_SYNC_ACTIONS = {"publish", "ingest", "reenrich", "scan_drift", "scrape_url",
+                  "snapshot", "sync_outbound", "backfill_trilium"}
 
 
 @server.tool(name="udh_sync", title="UDH Sync Operations", annotations=WR)
@@ -301,8 +353,12 @@ async def udh_sync(params: SyncIn, ctx: Context) -> str:
     docs to enabled targets), ingest (pull from a source), reenrich
     (re-run Claude/OpenAI enrichment on a doc), scan_drift (check for
     moved/deleted/changed source files), scrape_url (fetch a URL as a new
-    source document). These move data forward rather than restore or
-    destroy it — confirm=true is required, but no elevated scope.
+    source document), snapshot (immediate FileBrowser pre-op registry
+    backup for one doc_id — do this before a risky bulk action), sync_outbound
+    (ad-hoc outbound publish sweep across every enabled target, outside its
+    normal schedule), backfill_trilium (one-time historical Trilium-vault
+    import into the registry). These move data forward rather than restore
+    or destroy it — confirm=true is required, but no elevated scope.
     """
     if params.action not in _SYNC_ACTIONS:
         return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_SYNC_ACTIONS))}"
@@ -386,16 +442,17 @@ async def udh_conflicts(params: ConflictsIn, ctx: Context) -> str:
 
 class LifecycleIn(BaseModel):
     model_config = M
-    action: str = Field(..., description="rollback | confirm_delete | release_quarantine")
+    action: str = Field(..., description="rollback | confirm_delete | release_quarantine | purge_ingested")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required.")
     payload: Optional[dict] = Field(None, description=(
         "Action-specific fields (e.g. doc_id, backup version for rollback). "
         "See docs/udh/04-udh-architecture.md's workflow inventory (WF-10 "
-        "rollback) for exact fields."))
+        "rollback) for exact fields. purge_ingested needs "
+        "{'target_id': 'trilium'|'obsidian'|'paperless'|'affine'|'notion'}."))
 
 
-_LIFECYCLE_ACTIONS = {"rollback", "confirm_delete", "release_quarantine"}
+_LIFECYCLE_ACTIONS = {"rollback", "confirm_delete", "release_quarantine", "purge_ingested"}
 
 
 @server.tool(name="udh_lifecycle", title="UDH Lifecycle Operations", annotations=DE)
@@ -403,10 +460,18 @@ _LIFECYCLE_ACTIONS = {"rollback", "confirm_delete", "release_quarantine"}
 async def udh_lifecycle(params: LifecycleIn, ctx: Context) -> str:
     """Restore, overwrite, or destroy existing UDH state, via WF-07:
     rollback (restore a canonical file to a previous backup version and
-    re-publish), confirm_delete (permanently delete a document), or
+    re-publish), confirm_delete (permanently delete a document),
     release_quarantine (clear a document's quarantine_status after
-    repeated sync errors — confirms the underlying issue is fixed).
-    All three need 'admin' scope in addition to confirm=true.
+    repeated sync errors — confirms the underlying issue is fixed), or
+    purge_ingested (permanently delete every document doc_registry itself
+    recorded as ingested into one target — trilium/obsidian/paperless/
+    affine/notion only; never touches a document added to that target by
+    any other means, since it identifies documents strictly by the
+    per-row ID column doc_registry sets only when UDH's own outbound sync
+    wrote there. THIS IS IRREVERSIBLE from UDH's side even where the
+    target itself keeps its own trash/archive — see matrix-homelab's
+    wf07_client.py docstring for the full safety design). All four need
+    'admin' scope in addition to confirm=true.
     """
     if params.action not in _LIFECYCLE_ACTIONS:
         return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_LIFECYCLE_ACTIONS))}"
@@ -446,6 +511,192 @@ async def udh_control(params: ControlIn, ctx: Context) -> str:
         text = f"Would set global_pause={params.global_pause}. Set confirm=true to proceed."
         return out(text, preview("udh_control", resource="global_pause", payload=payload), params.output)
     ok, text, data = await dispatch("set_global_pause", payload)
+    return out(text, data, params.output) if ok else text
+
+
+# =================================================================== udh_health
+
+class HealthIn(BaseModel):
+    model_config = M
+    action: str = Field(..., description="check_health | check_integrity")
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+    confirm: bool = Field(False, description="Required.")
+    target_id: Optional[str] = Field(None, description="check_health: scope to one target_config row (e.g. 'trilium'). Accepted but NOT YET filtered server-side as of 2026-10-13 -- every target is checked regardless.")
+    case_folder: Optional[str] = Field(None, description="check_integrity: scope to one case folder. Accepted but NOT YET filtered server-side as of 2026-10-13 -- the whole registry is checked regardless.")
+
+
+_HEALTH_ACTIONS = {"check_health", "check_integrity"}
+
+
+@server.tool(name="udh_health", title="UDH Health & Integrity Checks", annotations=WR)
+@_logged_tool
+async def udh_health(params: HealthIn, ctx: Context) -> str:
+    """Trigger an on-demand adapter health check (WF-08) or canonical
+    integrity check (WF-11), via WF-07, instead of waiting for their
+    normal cron schedule. Added 2026-10-12 server-side in matrix-homelab
+    specifically to close the gap this server's own ROADMAP.md named as
+    A1/A2: before this, there was no way to ask "is the Notion adapter
+    actually working right now" or "did this week's integrity check
+    already run, and what did it find" without digging into n8n directly.
+
+    check_health: per-target round-trip test (auth still valid, API still
+    responds) -- catches an adapter silently broken before real documents
+    fail against it. target_id is accepted but every target is checked
+    regardless as of 2026-10-13 (not yet filtered server-side).
+
+    check_integrity: SHA-256 verification of every canonical file plus
+    orphaned-target-ID detection. case_folder is accepted but the whole
+    registry is checked regardless as of 2026-10-13 (same caveat).
+
+    Both trigger a real workflow run (not free) — confirm=true is
+    required, same as udh_sync, but only 'sync' scope, since neither
+    restores, overwrites, or destroys anything.
+    """
+    if params.action not in _HEALTH_ACTIONS:
+        return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_HEALTH_ACTIONS))}"
+    if not _has_scope("sync"):
+        return f"This token isn't scoped for udh_health action='{params.action}' — needs 'sync' (or '*')."
+    payload: dict = {}
+    if params.action == "check_health" and params.target_id:
+        payload["target_id"] = params.target_id
+    if params.action == "check_integrity" and params.case_folder:
+        payload["case_folder"] = params.case_folder
+    if not params.confirm:
+        text = f"Would {params.action} with {payload}. Set confirm=true to proceed."
+        return out(text, preview("udh_health", resource=params.action, payload=payload), params.output)
+    ok, text, data = await dispatch(params.action, payload)
+    return out(text, data, params.output) if ok else text
+
+
+# =================================================================== udh_config
+
+class ConfigIn(BaseModel):
+    model_config = M
+    action: str = Field(..., description="update_hub_config | update_target_config")
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+    confirm: bool = Field(False, description="Required.")
+    target_id: Optional[str] = Field(None, description="update_target_config (required): which target_config row, e.g. 'trilium'.")
+    field: str = Field(..., description=(
+        "update_hub_config: one of dry_run/max_global_batch/backup_versions_to_keep/"
+        "snapshot_keep_count/quarantine_after_errors/lock_timeout_seconds/"
+        "lock_retry_count/write_verification/soft_delete_only/echo_suppression/"
+        "conflict_timeout_hours/pre_bulk_snapshot/circuit_breaker_threshold/"
+        "default_source_of_truth (global_pause is deliberately excluded -- use "
+        "udh_control instead, to keep one control path for it). "
+        "update_target_config: one of enabled/sync_direction/endpoint/"
+        "credential_ref/database_id/source_priority/conflict_action/"
+        "max_batch_size/write_verification/circuit_breaker_threshold/dry_run/"
+        "poll_interval_mins/conflict_timeout_hours/inbound_workflow_id/"
+        "outbound_workflow_id/blocked_sensitivity_levels (target_id itself, "
+        "inbound_enabled/outbound_enabled -- use udh_targets instead -- and "
+        "last_inbound_check are excluded)."))
+    value: Any = Field(..., description="The new value for 'field'. An unrecognised field name is refused by WF-07's own Guard node before any write.")
+
+
+_CONFIG_ACTIONS = {"update_hub_config", "update_target_config"}
+
+
+@server.tool(name="udh_config", title="UDH Hub & Target Configuration", annotations=WR)
+@_logged_tool
+async def udh_config(params: ConfigIn, ctx: Context) -> str:
+    """Update one field of hub_config (global settings) or one
+    target_config row (per-target settings), via WF-07. Added 2026-10-12
+    server-side in matrix-homelab. Structurally verified there, not yet
+    confirmed against a live NAS/n8n instance as of 2026-10-13 -- the
+    first real use of either action should check the field's new value
+    via udh_dashboard afterward rather than trusting this call's own
+    response. 'sync' scope + confirm=true (this changes configuration,
+    not document data, so it doesn't need 'admin').
+    """
+    if params.action not in _CONFIG_ACTIONS:
+        return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_CONFIG_ACTIONS))}"
+    if params.action == "update_target_config" and not params.target_id:
+        return "update_target_config requires target_id."
+    if not _has_scope("sync"):
+        return f"This token isn't scoped for udh_config action='{params.action}' — needs 'sync' (or '*')."
+    payload: dict = {"field": params.field, "value": params.value}
+    if params.target_id:
+        payload["target_id"] = params.target_id
+    if not params.confirm:
+        text = f"Would {params.action} with {payload}. Set confirm=true to proceed."
+        return out(text, preview("udh_config", resource=params.field, payload=payload), params.output)
+    ok, text, data = await dispatch(params.action, payload)
+    return out(text, data, params.output) if ok else text
+
+
+# ================================================================= udh_templates
+
+class TemplatesIn(BaseModel):
+    model_config = M
+    action: str = Field(..., description=(
+        "list_templates | create_template | update_template | "
+        "delete_template | set_default_template"))
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+    confirm: bool = Field(False, description="Required for every action except list_templates.")
+    template_id: Optional[str] = Field(None, description="update/delete/set_default_template (required): the row to act on.")
+    name: Optional[str] = Field(None, description="create_template/update_template (required): display name.")
+    is_default: bool = Field(False, description="create_template/update_template: make this the template WF-02 reads for every future enrichment.")
+    target_scope: str = Field("all", description="create_template/update_template: 'all' or a comma-separated target id list -- descriptive only, not enforced (WF-02 enriches once for every target, see docs/udh/26-ingestion-templates-setup.md).")
+    metadata_fields: Optional[dict] = Field(None, description="create_template/update_template: which optional CDF frontmatter fields to write, e.g. {'title': true, 'author': true, 'physical_location': false, 'custom_fields': ['Court']}.")
+    docling_settings: Optional[dict] = Field(None, description="create_template/update_template: Docling extraction options, e.g. {'to_formats': 'md', 'do_table_structure': true}.")
+
+
+_TEMPLATE_ACTIONS = {"list_templates", "create_template", "update_template",
+                      "delete_template", "set_default_template"}
+_TEMPLATE_WRITE_ACTIONS = _TEMPLATE_ACTIONS - {"list_templates"}
+
+
+@server.tool(name="udh_templates", title="UDH Ingestion Templates", annotations=WR)
+@_logged_tool
+async def udh_templates(params: TemplatesIn, ctx: Context) -> str:
+    """Manage ingestion templates, via WF-07 — added 2026-10-13 alongside
+    matrix-homelab's own Templates dashboard page. The template flagged
+    is_default is what wf02_enrich_document.json reads before every
+    Docling extraction and canonical-document build: which optional CDF
+    frontmatter fields get written, and how Docling converts the source
+    file. See docs/udh/26-ingestion-templates-setup.md (matrix-homelab)
+    for the full field list and the one-time manual n8n Data Table
+    creation step this feature needs before any of these calls succeed.
+
+    list_templates needs no confirm (read-only, lists every row via
+    WF-07 — still needs 'sync' scope since it goes through the same
+    dispatch webhook as every write here, but nothing it does writes).
+    create_template/update_template/delete_template/set_default_template
+    all need confirm=true. 'sync' scope covers all five — none of these
+    touch existing document data, only future-enrichment configuration.
+    """
+    if params.action not in _TEMPLATE_ACTIONS:
+        return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_TEMPLATE_ACTIONS))}"
+    if not _has_scope("sync"):
+        return f"This token isn't scoped for udh_templates action='{params.action}' — needs 'sync' (or '*')."
+    if params.action in ("update_template", "delete_template", "set_default_template") and not params.template_id:
+        return f"{params.action} requires template_id."
+    if params.action in ("create_template", "update_template") and not params.name:
+        return f"{params.action} requires name."
+
+    payload: dict = {}
+    if params.action == "list_templates":
+        ok, text, data = await dispatch("list_templates", {})
+        return out(text, data, params.output) if ok else text
+
+    if params.action == "delete_template":
+        payload = {"template_id": params.template_id, "confirm": True}
+    elif params.action == "set_default_template":
+        payload = {"template_id": params.template_id}
+    else:  # create_template / update_template
+        payload = {
+            "name": params.name, "is_default": params.is_default,
+            "target_scope": params.target_scope,
+            "metadata_fields": params.metadata_fields or {},
+            "docling_settings": params.docling_settings or {},
+        }
+        if params.action == "update_template":
+            payload["template_id"] = params.template_id
+
+    if params.action in _TEMPLATE_WRITE_ACTIONS and not params.confirm:
+        text = f"Would {params.action} with {payload}. Set confirm=true to proceed."
+        return out(text, preview("udh_templates", resource=params.template_id or params.name, payload=payload), params.output)
+    ok, text, data = await dispatch(params.action, payload)
     return out(text, data, params.output) if ok else text
 
 
