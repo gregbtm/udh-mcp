@@ -148,7 +148,15 @@ it exists) → Portainer redeploys from `matrix-homelab/stacks/udh-mcp/`.
 See `ROADMAP.md` for the full, detailed backlog — produced by reviewing
 every UDH workflow (WF-01 through WF-16) against this server's current
 7-tool surface before anything here was deployed. Short version: no tool
-can read actual document content (only registry metadata), WF-08/WF-11
-(adapter health, integrity checks) have no external trigger at all, and
-`hub_config`/`target_config` are read-only through MCP today. Nothing in
-that file is built yet.
+can read actual document content (only registry metadata). Nothing in
+that file is built *in this repo* yet, but three of its prerequisites
+were built from `matrix-homelab` instead (2026-10-12/13, for
+`apps/udh-dashboard`'s Settings page, not for this server's own tools):
+WF-08/WF-11 (adapter health, integrity checks) now have an on-demand
+`executeWorkflowTrigger` WF-07 can call; `hub_config`/`target_config`
+gained real `update_hub_config`/`update_target_config` WF-07 actions
+(C1/C2's n8n half); and a new `purge_ingested` action can delete
+documents UDH itself ingested into trilium/obsidian/paperless (D4's
+adjacent deletion mechanism, not target retirement itself). All
+structurally verified, none confirmed live. What's still missing here is
+purely udh-mcp-side: none of these are exposed as MCP tools yet.

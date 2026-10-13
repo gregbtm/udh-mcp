@@ -289,6 +289,23 @@ confirm=true)` action — `admin`-gated, and should refuse if the target
 still has pending/error-status documents rather than silently stranding
 them.
 
+**Related, adjacent capability built 2026-10-13 (not this item):**
+`wf07_adhoc_dispatch.json` gained a `purge_ingested(target_id, confirm)`
+action — deletes every document `doc_registry` recorded as UDH-ingested
+into `target_id` (identified strictly by that target's own per-row ID
+column: `trilium_note_id`/`obsidian_path`/`paperless_doc_id`, set only
+when UDH's own outbound sync wrote there -- never anything scanned from
+the target's own storage, so a document added by another method is
+structurally untouched). Built from `matrix-homelab` for the
+`apps/udh-dashboard` Settings page, not from this repo, and currently
+covers only trilium/obsidian/paperless (the targets whose delete
+endpoint is confirmed from their real outbound workflow files).
+Structurally verified, not yet confirmed live. This is the data-deletion
+half of "retiring" a target -- it doesn't touch the `target_config` row
+itself, which is still exactly D4's gap. A future `udh_targets.retire()`
+could call `purge_ingested` first (with the caller's confirmation) and
+then clear/disable the row, rather than reinventing the deletion logic.
+
 ---
 
 ## E. Server-side design improvements (udh-mcp itself — no n8n changes)
