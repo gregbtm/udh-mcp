@@ -293,14 +293,20 @@ them.
 `wf07_adhoc_dispatch.json` gained a `purge_ingested(target_id, confirm)`
 action — deletes every document `doc_registry` recorded as UDH-ingested
 into `target_id` (identified strictly by that target's own per-row ID
-column: `trilium_note_id`/`obsidian_path`/`paperless_doc_id`, set only
-when UDH's own outbound sync wrote there -- never anything scanned from
-the target's own storage, so a document added by another method is
-structurally untouched). Built from `matrix-homelab` for the
-`apps/udh-dashboard` Settings page, not from this repo, and currently
-covers only trilium/obsidian/paperless (the targets whose delete
-endpoint is confirmed from their real outbound workflow files).
-Structurally verified, not yet confirmed live. This is the data-deletion
+column: `trilium_note_id`/`obsidian_path`/`paperless_doc_id`/
+`affine_doc_id`/`notion_page_id`, set only when UDH's own outbound sync
+wrote there -- never anything scanned from the target's own storage, so
+a document added by another method is structurally untouched). Built
+from `matrix-homelab` for the `apps/udh-dashboard` Settings page, not
+from this repo. **Extended 2026-10-13** to affine (AFFiNE's own
+`trash_doc`, reversible) and notion (Notion has no hard-delete API --
+`archived: true` is the real, reversible mechanism, same as Notion's own
+UI trash) -- now covers all 5 targets with a confirmed outbound write
+pattern. affine's exact delete-tool parameter name was inferred from
+that same AFFiNE MCP server's other confirmed tools (not independently
+verified for `trash_doc` itself), so it carries more residual risk than
+the other four; test it alone before a bulk run. Structurally verified,
+not yet confirmed live. This is the data-deletion
 half of "retiring" a target -- it doesn't touch the `target_config` row
 itself, which is still exactly D4's gap. A future `udh_targets.retire()`
 could call `purge_ingested` first (with the caller's confirmation) and

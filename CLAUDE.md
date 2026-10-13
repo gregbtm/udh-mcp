@@ -156,7 +156,14 @@ WF-08/WF-11 (adapter health, integrity checks) now have an on-demand
 `executeWorkflowTrigger` WF-07 can call; `hub_config`/`target_config`
 gained real `update_hub_config`/`update_target_config` WF-07 actions
 (C1/C2's n8n half); and a new `purge_ingested` action can delete
-documents UDH itself ingested into trilium/obsidian/paperless (D4's
-adjacent deletion mechanism, not target retirement itself). All
-structurally verified, none confirmed live. What's still missing here is
-purely udh-mcp-side: none of these are exposed as MCP tools yet.
+documents UDH itself ingested into trilium/obsidian/paperless/affine/
+notion (D4's adjacent deletion mechanism, not target retirement itself;
+also fixed a real registry bug while extending to affine -- its outbound
+write had been discarding the AFFiNE document id instead of persisting
+it, so there was no reliable way to identify which AFFiNE doc to purge
+until that was fixed). Also added an early source-hash short-circuit to
+WF-02 so re-enrichment skips Docling/Claude entirely when the source is
+confirmed unchanged, rather than only skipping the final write as
+before. All structurally verified, none confirmed live. What's still
+missing here is purely udh-mcp-side: none of these are exposed as MCP
+tools yet.
