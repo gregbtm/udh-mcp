@@ -637,7 +637,7 @@ class TemplatesIn(BaseModel):
     name: Optional[str] = Field(None, description="create_template/update_template (required): display name.")
     is_default: bool = Field(False, description="create_template/update_template: make this the template WF-02 reads for every future enrichment.")
     target_scope: str = Field("all", description="create_template/update_template: 'all' or a comma-separated target id list -- descriptive only, not enforced (WF-02 enriches once for every target, see docs/udh/26-ingestion-templates-setup.md).")
-    metadata_fields: Optional[dict] = Field(None, description="create_template/update_template: which optional CDF frontmatter fields to write, e.g. {'title': true, 'author': true, 'physical_location': false, 'custom_fields': ['Court']}.")
+    metadata_fields: Optional[dict] = Field(None, description="create_template/update_template: which optional CDF frontmatter fields to write, e.g. {'title': true, 'author': true, 'parties': true, 'key_dates': true, 'jurisdiction': true, 'privileged': true, 'physical_location': false, 'custom_fields': ['Court']}. Any key is accepted -- WF-02's 'Build CDF' node is the single source of truth for which keys it actually understands (see matrix-homelab's docs/udh/26-ingestion-templates-setup.md for the current full list).")
     docling_settings: Optional[dict] = Field(None, description="create_template/update_template: Docling extraction options, e.g. {'to_formats': 'md', 'do_table_structure': true}.")
 
 
