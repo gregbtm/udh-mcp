@@ -577,7 +577,7 @@ class ConfigIn(BaseModel):
     confirm: bool = Field(False, description="Required.")
     target_id: Optional[str] = Field(None, description="update_target_config (required): which target_config row, e.g. 'trilium'.")
     field: str = Field(..., description=(
-        "update_hub_config: one of dry_run/max_global_batch/backup_versions_to_keep/"
+        "update_hub_config: one of legal_mode/dry_run/max_global_batch/backup_versions_to_keep/"
         "snapshot_keep_count/quarantine_after_errors/lock_timeout_seconds/"
         "lock_retry_count/write_verification/soft_delete_only/echo_suppression/"
         "conflict_timeout_hours/pre_bulk_snapshot/circuit_breaker_threshold/"
