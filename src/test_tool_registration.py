@@ -22,6 +22,8 @@ EXPECTED_TOOLS = {
     "udh_dashboard", "udh_query", "udh_sync", "udh_targets",
     "udh_conflicts", "udh_lifecycle", "udh_control",
     "udh_health", "udh_config", "udh_templates",
+    "udh_simulate", "udh_checkpoint", "udh_tokens",
+    "udh_tags", "udh_fleet",
 }
 
 failed = []
@@ -403,6 +405,36 @@ async def main() -> None:
         auth_context_var.reset(unset_ctx)
 
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
+    
+    # udh_simulate
+    r = await server.udh_simulate(server.SimulateIn(scenario="et_witness_statement"), _FakeCtx())
+    check("udh_simulate executes dry-run simulation and returns 64-bit simhash", "0x" in r and "UDH Pipeline Simulation" in r)
+
+    # udh_checkpoint
+    r = await server.udh_checkpoint(server.CheckpointIn(action="create", name="pre-batch-test"), _FakeCtx())
+    check("udh_checkpoint create succeeds with sync scope", "pre-batch-test" in r)
+
+    r = await server.udh_checkpoint(server.CheckpointIn(action="restore", checkpoint_id="cp-123", confirm=False), _FakeCtx())
+    check("udh_checkpoint restore confirm=false previews without mutating", "Would restore" in r)
+
+    # udh_tokens
+    r = await server.udh_tokens(server.TokensIn(action="get_metrics"), _FakeCtx())
+    check("udh_tokens get_metrics returns token burn stats", "UDH Token Burn Status" in r)
+
+    r = await server.udh_tokens(server.TokensIn(action="set_budget", daily_budget=200000), _FakeCtx())
+    check("udh_tokens set_budget updates daily cap", "200,000" in r)
+
+    # udh_tags
+    r = await server.udh_tags(server.TagsIn(action="cluster_tags"), _FakeCtx())
+    check("udh_tags cluster_tags detects synonyms and clusters", "Discovered" in r)
+
+    r = await server.udh_tags(server.TagsIn(action="consolidate_tags", canonical_tag="invoice", deprecated_tags=["invoices"], confirm=False), _FakeCtx())
+    check("udh_tags consolidate_tags confirm=false previews without writing", "Would consolidate" in r)
+
+    # udh_fleet
+    r = await server.udh_fleet(server.FleetIn(action="get_status"), _FakeCtx())
+    check("udh_fleet get_status probes 5 core UDH services", "UDH Container Fleet" in r)
+
     if failed:
         sys.exit(1)
 

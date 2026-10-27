@@ -58,7 +58,8 @@ DISPATCH_ACTIONS = [
     "backfill_trilium", "update_hub_config", "update_target_config",
     "check_health", "check_integrity", "purge_ingested", "list_templates",
     "create_template", "update_template", "delete_template",
-    "set_default_template",
+    "set_default_template", "dry_run_pipeline", "create_checkpoint",
+    "rollback_checkpoint", "cluster_tags", "get_token_burn",
 ]
 # Actions that restore, overwrite, or destroy existing state rather than
 # move data forward. purge_ingested added 2026-10-13 -- it permanently
@@ -67,7 +68,7 @@ DISPATCH_ACTIONS = [
 # IRREVERSIBLE from UDH's side"), the same destructive tier as
 # confirm_delete.
 DESTRUCTIVE_ACTIONS = {"rollback", "confirm_delete", "resolve_conflict",
-                        "release_quarantine", "purge_ingested"}
+                        "release_quarantine", "purge_ingested", "rollback_checkpoint"}
 # Ungated at the WF-07 layer itself (UNGATED_ACTIONS) -- must keep working
 # even while hub_config.global_pause is true, so a paused system can still
 # be un-paused and a misbehaving target can still be disabled.
