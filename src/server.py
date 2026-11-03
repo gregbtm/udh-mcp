@@ -1040,12 +1040,14 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
         return "This token isn't scoped for udh_fleet — needs 'read' (or '*')."
     
     import socket
+    dashboard_port = int(os.environ.get("UDH_DASHBOARD_PORT", 12015))
+    mcp_port = int(os.environ.get("UDH_MCP_PORT", 12021))
     services = [
-        {"id": "udh-dashboard", "name": "UDH Dashboard", "port": 8080},
-        {"id": "udh-mcp", "name": "UDH MCP Server", "port": 12021},
-        {"id": "n8n", "name": "n8n Core", "port": 5678},
-        {"id": "udh-qdrant", "name": "Qdrant Vector DB", "port": 6333},
-        {"id": "dbackup", "name": "DBackup Engine", "port": 8000},
+        {"id": "udh-dashboard", "name": "UDH Dashboard", "ports": [dashboard_port, 8080]},
+        {"id": "udh-mcp", "name": "UDH MCP Server", "ports": [mcp_port]},
+        {"id": "n8n", "name": "n8n Core", "ports": [5678]},
+        {"id": "udh-qdrant", "name": "Qdrant Vector DB", "ports": [6333]},
+        {"id": "dbackup", "name": "DBackup Engine", "ports": [8000]},
     ]
     
     results = []
@@ -1053,17 +1055,21 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
     for s in services:
         t0 = time.monotonic()
         ok = False
-        try:
-            with socket.create_connection(("127.0.0.1", s["port"]), timeout=0.3):
-                ok = True
-        except Exception:
-            ok = False
+        active_port = s["ports"][0]
+        for p in s["ports"]:
+            try:
+                with socket.create_connection(("127.0.0.1", p), timeout=0.3):
+                    ok = True
+                    active_port = p
+                    break
+            except Exception:
+                pass
         lat = int((time.monotonic() - t0) * 1000)
         if ok:
             healthy_count += 1
         results.append({
             "service": s["name"],
-            "port": s["port"],
+            "port": active_port,
             "status": "HEALTHY" if ok else "UNREACHABLE",
             "latency_ms": max(1, lat) if ok else 0,
         })
