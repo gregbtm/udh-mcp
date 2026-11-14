@@ -463,6 +463,40 @@ async def main() -> None:
     r = await server.udh_updates(server.UpdatesIn(action="trigger_update", confirm=False), _FakeCtx())
     check("udh_updates trigger confirm=false previews without mutating", "Dry-run preview" in r)
 
+    # Option E Stage 1 native backend routing in core.py
+    fake_native = _FakeHTTP()
+
+    class _ShimNative:
+        AsyncClient = staticmethod(lambda *a, **k: fake_native)
+
+    _oh_n = core.httpx
+    _old_mode = core.UDH_BACKEND_MODE
+    _old_pref = core.UDH_PREFER_NATIVE
+    _old_dash = core.UDH_DASHBOARD_URL
+    core.httpx = _ShimNative
+    core.UDH_BACKEND_MODE = "native"
+    core.UDH_DASHBOARD_URL = "https://udh-dashboard.test"
+    try:
+        ok, text, _ = await core.dispatch("check_health", {})
+        check("Option E native dispatch posts to /api/native/dispatch",
+              ok and len(fake_native.calls["posts"]) == 1
+              and fake_native.calls["posts"][0][0] == "https://udh-dashboard.test/api/native/dispatch")
+
+        ok_q, _, _ = await core.query("list_conflicts", {})
+        check("Option E native query posts to /api/native/query",
+              ok_q and len(fake_native.calls["posts"]) == 2
+              and fake_native.calls["posts"][1][0] == "https://udh-dashboard.test/api/native/query")
+
+        ok_d, _, _ = await core.dashboard_data()
+        check("Option E native dashboard_data gets /api/native/dashboard-data",
+              ok_d and len(fake_native.calls["gets"]) == 1
+              and fake_native.calls["gets"][0][0] == "https://udh-dashboard.test/api/native/dashboard-data")
+    finally:
+        core.httpx = _oh_n
+        core.UDH_BACKEND_MODE = _old_mode
+        core.UDH_PREFER_NATIVE = _old_pref
+        core.UDH_DASHBOARD_URL = _old_dash
+
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:
         sys.exit(1)

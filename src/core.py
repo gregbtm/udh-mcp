@@ -41,6 +41,13 @@ WF16_AUTH_TOKEN = os.environ.get("WF16_AUTH_TOKEN", "").strip()
 WF16_AUTH_HEADER_NAME = os.environ.get("WF16_AUTH_HEADER_NAME", "X-UDH-Query-Token").strip()
 
 UDH_DASHBOARD_URL = os.environ.get("UDH_DASHBOARD_URL", "https://udh-dashboard.nasmatrix.app").strip().rstrip("/")
+UDH_PREFER_NATIVE = os.environ.get("UDH_PREFER_NATIVE", "false").strip().lower() in ("1", "true", "yes")
+UDH_BACKEND_MODE = os.environ.get("UDH_BACKEND_MODE", "strangler").strip().lower()
+
+
+def _use_native_backend() -> bool:
+    """True when udh-mcp should call udh-dashboard's native /api/native/* endpoints instead of n8n."""
+    return UDH_BACKEND_MODE == "native" or UDH_PREFER_NATIVE
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 _POOL_CLIENT: Optional[httpx.AsyncClient] = None
@@ -120,12 +127,20 @@ UNGATED_ACTIONS = {"set_global_pause", "set_target_enabled"}
 
 async def dispatch(action: str, payload: Optional[dict] = None,
                     timeout: float = 60.0) -> tuple:
-    """POST one action to WF-07's adhoc-dispatch webhook. Returns (ok, text, data).
+    """POST one action to native /api/native/dispatch (Option E) or WF-07 webhook."""
+    if _use_native_backend():
+        ok, text, data = await dashboard_api(
+            "/api/native/dispatch",
+            method="POST",
+            json_body={"action": action, **(payload or {})},
+            timeout=timeout,
+        )
+        if not ok:
+            return False, text, data
+        if isinstance(data, dict) and data.get("halted"):
+            return False, data.get("message") or f"Native gate halted action '{action}'", data
+        return True, f"Dispatched '{action}' (native): {json.dumps(data, default=str)[:500]}", data
 
-    Mirrors matrix-homelab's apps/udh-dashboard/wf07_client.py exactly --
-    same env var names, same {"halted": true} handling for an unknown
-    action or a global-pause block.
-    """
     if not WF07_URL or not WF07_AUTH_TOKEN:
         return False, "WF07_URL / WF07_AUTH_TOKEN not configured.", None
     body = {"action": action, **(payload or {})}
@@ -154,7 +169,9 @@ async def dispatch(action: str, payload: Optional[dict] = None,
 
 
 async def dashboard_data(timeout: float = 30.0) -> tuple:
-    """GET WF-14's dashboard-data webhook. Returns (ok, text, data). Read-only."""
+    """GET native /api/native/dashboard-data (Option E) or WF-14's webhook. Read-only."""
+    if _use_native_backend():
+        return await dashboard_api("/api/native/dashboard-data", method="GET", timeout=timeout)
     if not WF14_URL or not WF14_AUTH_TOKEN:
         return False, "WF14_URL / WF14_AUTH_TOKEN not configured.", None
     try:
@@ -185,6 +202,18 @@ async def query(kind: str, params: Optional[dict] = None,
     """
     if kind not in QUERY_KINDS:
         return False, f"Unknown query kind '{kind}'. Kinds: {', '.join(QUERY_KINDS)}", None
+    if _use_native_backend():
+        ok, text, data = await dashboard_api(
+            "/api/native/query",
+            method="POST",
+            json_body={"kind": kind, **(params or {})},
+            timeout=timeout,
+        )
+        if not ok:
+            return False, text, data
+        if isinstance(data, dict) and data.get("error"):
+            return False, str(data["error"]), data
+        return True, text, data
     if not WF16_URL or not WF16_AUTH_TOKEN:
         return False, "WF16_URL / WF16_AUTH_TOKEN not configured.", None
     body = {"kind": kind, **(params or {})}
