@@ -1062,8 +1062,8 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
                     ok = True
                     active_port = p
                     break
-            except Exception:
-                pass
+            except OSError as exc:
+                log.debug("Socket probe failed for %s:%s: %s", s["id"], p, exc)
         lat = int((time.monotonic() - t0) * 1000)
         if ok:
             healthy_count += 1
@@ -1073,15 +1073,22 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
             "status": "HEALTHY" if ok else "UNREACHABLE",
             "latency_ms": max(1, lat) if ok else 0,
         })
-    
+
+    version_info = {
+        "version": os.getenv("UDH_MCP_VERSION", "2.4.0"),
+        "git_sha": os.getenv("UDH_MCP_GIT_SHA", "dev"),
+        "build_date": os.getenv("UDH_MCP_BUILD_DATE", "unknown"),
+    }
     data = {
         "all_healthy": (healthy_count == len(services)),
         "healthy_count": healthy_count,
         "total_count": len(services),
+        "version": version_info,
         "services": results,
     }
     text = (
-        f"UDH Container Fleet: {healthy_count}/{len(services)} Healthy\n" +
+        f"UDH Container Fleet (udh-mcp v{version_info['version']} @ {version_info['git_sha'][:7]}): "
+        f"{healthy_count}/{len(services)} Healthy\n" +
         "\n".join(f"• {r['service']:<18} Port {r['port']:<5} -> {r['status']} ({r['latency_ms']}ms)" for r in results)
     )
     return out(text, data, params.output)

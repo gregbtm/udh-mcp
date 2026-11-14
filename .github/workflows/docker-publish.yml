@@ -73,6 +73,10 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            UDH_MCP_VERSION=2.4.${{ github.run_number }}
+            UDH_MCP_GIT_SHA=${{ github.sha }}
+            UDH_MCP_BUILD_DATE=${{ github.event.head_commit.timestamp || 'unknown' }}
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.run_number }}
