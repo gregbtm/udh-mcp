@@ -1039,7 +1039,7 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
     if not _has_scope("read"):
         return "This token isn't scoped for udh_fleet — needs 'read' (or '*')."
     
-    import socket
+    import asyncio
     dashboard_port = int(os.environ.get("UDH_DASHBOARD_PORT", 12015))
     mcp_port = int(os.environ.get("UDH_MCP_PORT", 12021))
     services = [
@@ -1049,30 +1049,33 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
         {"id": "udh-qdrant", "name": "Qdrant Vector DB", "ports": [6333]},
         {"id": "dbackup", "name": "DBackup Engine", "ports": [8000]},
     ]
-    
-    results = []
-    healthy_count = 0
-    for s in services:
+
+    async def _probe_service(s: dict) -> dict:
         t0 = time.monotonic()
         ok = False
         active_port = s["ports"][0]
         for p in s["ports"]:
             try:
-                with socket.create_connection(("127.0.0.1", p), timeout=0.3):
-                    ok = True
-                    active_port = p
-                    break
+                _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", p), timeout=0.3)
+                writer.close()
+                await writer.wait_closed()
+                ok = True
+                active_port = p
+                break
             except OSError as exc:
                 log.debug("Socket probe failed for %s:%s: %s", s["id"], p, exc)
         lat = int((time.monotonic() - t0) * 1000)
-        if ok:
-            healthy_count += 1
-        results.append({
+        return {
             "service": s["name"],
             "port": active_port,
             "status": "HEALTHY" if ok else "UNREACHABLE",
             "latency_ms": max(1, lat) if ok else 0,
-        })
+            "_ok": ok,
+        }
+
+    probed = await asyncio.gather(*(_probe_service(s) for s in services))
+    healthy_count = sum(1 for r in probed if r.pop("_ok"))
+    results = list(probed)
 
     version_info = {
         "version": os.getenv("UDH_MCP_VERSION", "2.4.0"),
@@ -1210,6 +1213,76 @@ async def udh_bundle_seal(params: BundleSealInput) -> str:
         sol_line = f"\n• Schedule of Loss Total: £{total:,.2f} (Basic £{basic:,.2f} + Comp £{comp:,.2f} + Vento £{vento:,.2f} + ACAS £{uplift:,.2f})"
 
     text = f"Custody Seal {data['seal_short']} for {params.doc_id}\n• SHA-256: {digest}\n• Timestamp: {ts}{sol_line}"
+    return out(text, data, params.output)
+
+
+class DictionaryIn(BaseModel):
+    model_config = M
+    resource: str = Field("dictionary", description="'dictionary' | 'errors' | 'error_code'.")
+    domain: Optional[str] = Field(None, description="Optional domain filter (core_tables, target_adapters, frontmatter, apis, mcp).")
+    query: Optional[str] = Field(None, description="Optional search query or UDH-XXX error code.")
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+
+
+@server.tool(name="udh_dictionary", title="UDH Data Dictionary & Error Catalog", annotations=RD)
+@_logged_tool
+async def udh_dictionary(params: DictionaryIn, ctx: Context) -> str:
+    """Query UDH Dashboard's Data Dictionary (/api/dictionary) and 100-item
+    Error & Fallback Catalog (/api/errors/catalog or /api/errors/{code}).
+    Read-only — requires 'read' scope.
+    """
+    if not _has_scope("read"):
+        return "This token isn't scoped for udh_dictionary — needs 'read' (or '*')."
+    from urllib.parse import urlencode
+
+    res = params.resource.strip().lower()
+    if res == "error_code":
+        code = (params.query or "").strip()
+        if not code:
+            return "query is required when resource='error_code' (e.g. 'UDH-001')."
+        ok, text, data = await core.dashboard_api(f"/api/errors/{code}")
+    elif res == "errors":
+        ok, text, data = await core.dashboard_api("/api/errors/catalog")
+    else:
+        qs = urlencode({k: v for k, v in (("domain", params.domain), ("q", params.query)) if v})
+        path = f"/api/dictionary?{qs}" if qs else "/api/dictionary"
+        ok, text, data = await core.dashboard_api(path)
+    if not ok:
+        return f"UDH Dictionary lookup failed: {text}"
+    return out(text, data, params.output)
+
+
+class UpdatesIn(BaseModel):
+    model_config = M
+    action: str = Field("check_version", description="'check_version' | 'check_updates' | 'trigger_update'.")
+    confirm: bool = Field(False, description="Required (true) for trigger_update.")
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+
+
+@server.tool(name="udh_updates", title="UDH Version & Update Control", annotations=WR)
+@_logged_tool
+async def udh_updates(params: UpdatesIn, ctx: Context) -> str:
+    """Check UDH Dashboard running version (/api/version), check GitHub for
+    updates (/api/updates/check), or trigger Portainer redeploy (/api/updates/trigger).
+    check_* requires 'read' scope; trigger_update requires 'sync' scope and confirm=true.
+    """
+    act = params.action.strip().lower()
+    if act == "trigger_update":
+        if not _has_scope("sync"):
+            return "This token isn't scoped for udh_updates trigger — needs 'sync' (or '*')."
+        if not params.confirm:
+            return "Dry-run preview: would POST /api/updates/trigger with confirm=true. Pass confirm=true to execute."
+        ok, text, data = await core.dashboard_api("/api/updates/trigger", method="POST", json_body={"confirm": True})
+    elif act == "check_updates":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_updates — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/updates/check")
+    else:
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_updates — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/version")
+    if not ok:
+        return f"UDH Updates call failed: {text}"
     return out(text, data, params.output)
 
 

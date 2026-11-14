@@ -25,6 +25,7 @@ EXPECTED_TOOLS = {
     "udh_simulate", "udh_checkpoint", "udh_tokens",
     "udh_tags", "udh_fleet",
     "udh_extract", "udh_bundle_seal",
+    "udh_dictionary", "udh_updates",
 }
 
 failed = []
@@ -443,6 +444,24 @@ async def main() -> None:
     # udh_bundle_seal
     r = await server.udh_bundle_seal(server.BundleSealInput(doc_id="bundle-1", content="Canonical text", weekly_gross=700.0, years_service=4))
     check("udh_bundle_seal generates SHA-256 custody seal", "Custody Seal" in r and "SHA-256:" in r)
+
+    # udh_dictionary & udh_updates (scope gating + dry-run preview)
+    restricted = ctx_with_scopes("sync")
+    try:
+        r = await server.udh_dictionary(server.DictionaryIn(resource="dictionary"), _FakeCtx())
+        check("udh_dictionary refuses a token without 'read' scope", "read" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted)
+
+    restricted = ctx_with_scopes("read")
+    try:
+        r = await server.udh_updates(server.UpdatesIn(action="trigger_update", confirm=True), _FakeCtx())
+        check("udh_updates trigger refuses a token without 'sync' scope", "sync" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted)
+
+    r = await server.udh_updates(server.UpdatesIn(action="trigger_update", confirm=False), _FakeCtx())
+    check("udh_updates trigger confirm=false previews without mutating", "Dry-run preview" in r)
 
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:

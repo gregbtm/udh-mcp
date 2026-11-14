@@ -40,6 +40,48 @@ WF16_URL = os.environ.get("WF16_URL", "").strip().rstrip("/")
 WF16_AUTH_TOKEN = os.environ.get("WF16_AUTH_TOKEN", "").strip()
 WF16_AUTH_HEADER_NAME = os.environ.get("WF16_AUTH_HEADER_NAME", "X-UDH-Query-Token").strip()
 
+UDH_DASHBOARD_URL = os.environ.get("UDH_DASHBOARD_URL", "https://udh-dashboard.nasmatrix.app").strip().rstrip("/")
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+_POOL_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_pooled_client() -> httpx.AsyncClient:
+    """Return a shared persistent AsyncClient with connection pooling."""
+    global _POOL_CLIENT
+    if _POOL_CLIENT is None or _POOL_CLIENT.is_closed:
+        _POOL_CLIENT = _REAL_ASYNC_CLIENT(
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+    return _POOL_CLIENT
+
+
+async def _http_call(method: str, url: str, *, headers: Optional[dict] = None,
+                     json_body: Optional[dict] = None, timeout: float = 30.0) -> httpx.Response:
+    """Execute an HTTP call using the shared connection pool unless mocked in tests."""
+    if httpx.AsyncClient is not _REAL_ASYNC_CLIENT:
+        async with httpx.AsyncClient(timeout=timeout) as h:
+            if method.upper() == "GET":
+                return await h.get(url, headers=headers)
+            return await getattr(h, method.lower())(url, headers=headers, json=json_body)
+    client = _get_pooled_client()
+    return await client.request(method, url, headers=headers, json=json_body, timeout=timeout)
+
+
+async def dashboard_api(path: str, method: str = "GET",
+                        json_body: Optional[dict] = None, timeout: float = 15.0) -> tuple:
+    """Call UDH Dashboard REST API (/api/dictionary, /api/errors, /api/version, /api/updates)."""
+    url = f"{UDH_DASHBOARD_URL}{path}"
+    try:
+        r = await _http_call(method, url, headers={"Accept": "application/json"},
+                             json_body=json_body, timeout=timeout)
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}", None
+        data = r.json() if r.content else {}
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", None
+    return True, json.dumps(data, indent=2, default=str), data
+
 # WF-07's own Global Pause Gate node (matrix-homelab's n8n-workflows/
 # wf07_adhoc_dispatch.json VALID_ACTIONS list) -- keep in sync if that
 # list ever changes there. Synced 2026-10-13 to add thirteen actions added
@@ -60,6 +102,7 @@ DISPATCH_ACTIONS = [
     "create_template", "update_template", "delete_template",
     "set_default_template", "dry_run_pipeline", "create_checkpoint",
     "rollback_checkpoint", "cluster_tags", "get_token_burn",
+    "get_target_copy", "adapter_dispatch",
 ]
 # Actions that restore, overwrite, or destroy existing state rather than
 # move data forward. purge_ingested added 2026-10-13 -- it permanently
@@ -87,18 +130,21 @@ async def dispatch(action: str, payload: Optional[dict] = None,
         return False, "WF07_URL / WF07_AUTH_TOKEN not configured.", None
     body = {"action": action, **(payload or {})}
     try:
-        async with httpx.AsyncClient(timeout=timeout) as h:
-            r = await h.post(WF07_URL,
-                              headers={WF07_AUTH_HEADER_NAME: WF07_AUTH_TOKEN,
-                                       "Content-Type": "application/json",
-                                       "Accept": "application/json"},
-                              json=body)
-            if r.status_code != 200:
-                return False, f"HTTP {r.status_code}: {r.text[:300]}", None
-            try:
-                data = r.json() if r.content else {}
-            except Exception:
-                return False, f"WF-07 response was not valid JSON: {r.text[:300]}", None
+        r = await _http_call(
+            "POST",
+            WF07_URL,
+            headers={WF07_AUTH_HEADER_NAME: WF07_AUTH_TOKEN,
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"},
+            json_body=body,
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}", None
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            return False, f"WF-07 response was not valid JSON: {r.text[:300]}", None
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", None
 
@@ -112,12 +158,15 @@ async def dashboard_data(timeout: float = 30.0) -> tuple:
     if not WF14_URL or not WF14_AUTH_TOKEN:
         return False, "WF14_URL / WF14_AUTH_TOKEN not configured.", None
     try:
-        async with httpx.AsyncClient(timeout=timeout) as h:
-            r = await h.get(WF14_URL, headers={WF14_AUTH_HEADER_NAME: WF14_AUTH_TOKEN,
-                                                "Accept": "application/json"})
-            if r.status_code != 200:
-                return False, f"HTTP {r.status_code}: {r.text[:300]}", None
-            data = r.json() if r.content else {}
+        r = await _http_call(
+            "GET",
+            WF14_URL,
+            headers={WF14_AUTH_HEADER_NAME: WF14_AUTH_TOKEN, "Accept": "application/json"},
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}", None
+        data = r.json() if r.content else {}
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", None
     return True, json.dumps(data, indent=2, default=str), data
@@ -140,15 +189,18 @@ async def query(kind: str, params: Optional[dict] = None,
         return False, "WF16_URL / WF16_AUTH_TOKEN not configured.", None
     body = {"kind": kind, **(params or {})}
     try:
-        async with httpx.AsyncClient(timeout=timeout) as h:
-            r = await h.post(WF16_URL,
-                              headers={WF16_AUTH_HEADER_NAME: WF16_AUTH_TOKEN,
-                                       "Content-Type": "application/json",
-                                       "Accept": "application/json"},
-                              json=body)
-            if r.status_code != 200:
-                return False, f"HTTP {r.status_code}: {r.text[:300]}", None
-            data = r.json() if r.content else {}
+        r = await _http_call(
+            "POST",
+            WF16_URL,
+            headers={WF16_AUTH_HEADER_NAME: WF16_AUTH_TOKEN,
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"},
+            json_body=body,
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}", None
+        data = r.json() if r.content else {}
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", None
     if isinstance(data, dict) and data.get("error"):
