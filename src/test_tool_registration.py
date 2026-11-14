@@ -24,6 +24,7 @@ EXPECTED_TOOLS = {
     "udh_health", "udh_config", "udh_templates",
     "udh_simulate", "udh_checkpoint", "udh_tokens",
     "udh_tags", "udh_fleet",
+    "udh_extract", "udh_bundle_seal",
 }
 
 failed = []
@@ -435,6 +436,15 @@ async def main() -> None:
     r = await server.udh_fleet(server.FleetIn(action="get_status"), _FakeCtx())
     check("udh_fleet get_status probes 5 core UDH services", "UDH Container Fleet" in r)
 
+    # udh_extract
+    r = await server.udh_extract(server.ExtractInput(text="# Witness Statement\nClaimant cites [2024] EWCA Civ 123 and Employment Rights Act 1996 for £12,500.00."))
+    check("udh_extract extracts citations, statutes, and SimHash", "Zero-Token Extract" in r and "[2024] EWCA Civ 123" in r)
+
+    # udh_bundle_seal
+    r = await server.udh_bundle_seal(server.BundleSealInput(doc_id="bundle-1", content="Canonical text", weekly_gross=700.0, years_service=4))
+    check("udh_bundle_seal generates SHA-256 custody seal", "Custody Seal" in r and "SHA-256:" in r)
+
+    print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:
         sys.exit(1)
 

@@ -3,7 +3,13 @@ name: Build and Push to GHCR
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: udh-mcp-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/udh-mcp
@@ -15,6 +21,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,9 +30,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.lock.txt
+        run: pip install --quiet -r requirements.lock.txt
+
+      - name: Bytecode syntax check
+        run: python -m compileall -q src
 
       - name: Run tool-registration and behavior tests
         working-directory: src
@@ -34,6 +46,7 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,38 +55,40 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.run_number }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
-      # Same auto-redeploy pattern synology-proxy-mcp's docker-publish.yml
-      # uses, and the same fix matrix-homelab's 4 image workflows just got
-      # (2026-10-06): -f means a 404/5xx fails this step loudly rather than
-      # a bare curl's silent success. PORTAINER_WEBHOOK_UDH_MCP won't exist
-      # until the stack is created and gitops.py enable-webhook is run
-      # against it -- continue-on-error so that's a visible no-op, not a
-      # build failure, until then.
       - name: Trigger udh-mcp auto-redeploy
-        continue-on-error: true
+        if: github.event_name != 'pull_request'
         env:
           PORTAINER_WEBHOOK_UDH_MCP: ${{ secrets.PORTAINER_WEBHOOK_UDH_MCP }}
         run: |
-          if [ -n "$PORTAINER_WEBHOOK_UDH_MCP" ]; then
-            curl -fsS -X POST "$PORTAINER_WEBHOOK_UDH_MCP"
-          else
-            echo "PORTAINER_WEBHOOK_UDH_MCP not set -- skipping auto-redeploy trigger"
+          if [ -z "$PORTAINER_WEBHOOK_UDH_MCP" ]; then
+            echo "::warning::PORTAINER_WEBHOOK_UDH_MCP not set -- skipping auto-redeploy trigger"
+            exit 0
           fi
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$PORTAINER_WEBHOOK_UDH_MCP")
+          case "$code" in
+            2*) echo "fired: udh-mcp (HTTP $code)" ;;
+            *) echo "::error title=Redeploy failed::udh-mcp webhook returned HTTP $code"; exit 1 ;;
+          esac

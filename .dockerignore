@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.env
+.env.*
+src/test_*.py
+*.md
+run_server.bat

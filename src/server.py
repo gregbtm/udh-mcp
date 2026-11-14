@@ -1088,19 +1088,21 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
 
 
 class ExtractInput(BaseModel):
+    model_config = M
     text: str = Field(..., min_length=1, description="Document text or Markdown to extract metadata from.")
-    output: OutputMode = OutputMode.TEXT
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
 @server.tool(
     name="udh_extract",
+    title="UDH Zero-Token Extract",
     description=(
         "Zero-token deterministic extraction: extracts UK neutral citations, statutes, GBP currency, "
         "emails, dates, headings, word count, and 64-bit SimHash fingerprint with 0 LLM token burn."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=RD,
 )
-async def udh_extract(params: ExtractInput) -> list[TextContent]:
+async def udh_extract(params: ExtractInput) -> str:
     import hashlib
     import re
 
@@ -1144,6 +1146,7 @@ async def udh_extract(params: ExtractInput) -> list[TextContent]:
 
 
 class BundleSealInput(BaseModel):
+    model_config = M
     doc_id: str = Field(..., min_length=1, description="Document or bundle identifier.")
     content: str = Field(..., min_length=1, description="Canonical bundle or document text to seal.")
     actor: str = Field("udh-mcp", description="Custody seal actor identifier.")
@@ -1153,18 +1156,19 @@ class BundleSealInput(BaseModel):
     vento_band: int = Field(0, ge=0, le=3, description="Optional Vento injury-to-feelings band (0-3).")
     acas_uplift_pct: float = Field(0.0, ge=0.0, le=25.0, description="Optional ACAS Code uplift (0-25%).")
     weeks_unemployed: int = Field(0, ge=0, description="Optional weeks of compensatory loss.")
-    output: OutputMode = OutputMode.TEXT
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
 @server.tool(
     name="udh_bundle_seal",
+    title="UDH Chain-of-Custody Seal",
     description=(
         "Generate a deterministic SHA-256 chain-of-custody audit seal for a document or litigation bundle, "
         "and optionally compute an indicative UK Employment Tribunal Schedule of Loss (ERA 1996 / Vento / ACAS)."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+    annotations=RD,
 )
-async def udh_bundle_seal(params: BundleSealInput) -> list[TextContent]:
+async def udh_bundle_seal(params: BundleSealInput) -> str:
     import hashlib
     from datetime import datetime, timezone
 
