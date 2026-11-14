@@ -1143,6 +1143,65 @@ async def udh_extract(params: ExtractInput) -> list[TextContent]:
     return out(text, data, params.output)
 
 
+class BundleSealInput(BaseModel):
+    doc_id: str = Field(..., min_length=1, description="Document or bundle identifier.")
+    content: str = Field(..., min_length=1, description="Canonical bundle or document text to seal.")
+    actor: str = Field("udh-mcp", description="Custody seal actor identifier.")
+    weekly_gross: float = Field(0.0, ge=0.0, description="Optional weekly gross pay (GBP) for Schedule of Loss.")
+    years_service: int = Field(0, ge=0, description="Optional complete years of service.")
+    age: int = Field(35, ge=16, le=90, description="Optional claimant age for ERA 1996 multiplier.")
+    vento_band: int = Field(0, ge=0, le=3, description="Optional Vento injury-to-feelings band (0-3).")
+    acas_uplift_pct: float = Field(0.0, ge=0.0, le=25.0, description="Optional ACAS Code uplift (0-25%).")
+    weeks_unemployed: int = Field(0, ge=0, description="Optional weeks of compensatory loss.")
+    output: OutputMode = OutputMode.TEXT
+
+
+@server.tool(
+    name="udh_bundle_seal",
+    description=(
+        "Generate a deterministic SHA-256 chain-of-custody audit seal for a document or litigation bundle, "
+        "and optionally compute an indicative UK Employment Tribunal Schedule of Loss (ERA 1996 / Vento / ACAS)."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+)
+async def udh_bundle_seal(params: BundleSealInput) -> list[TextContent]:
+    import hashlib
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).isoformat()
+    payload = f"{params.doc_id}|{params.actor}|{ts}|{params.content}".encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    data: dict[str, Any] = {
+        "doc_id": params.doc_id,
+        "actor": params.actor,
+        "timestamp_utc": ts,
+        "sha256": digest,
+        "seal_short": digest[:12].upper(),
+    }
+
+    sol_line = ""
+    if params.weekly_gross > 0 or params.vento_band > 0:
+        capped_week = min(params.weekly_gross, 700.0)
+        capped_years = min(params.years_service, 20)
+        mult = 1.5 if params.age >= 41 else (1.0 if params.age >= 22 else 0.5)
+        basic = round(capped_week * capped_years * mult, 2)
+        comp = round(params.weekly_gross * params.weeks_unemployed, 2)
+        vento = {0: 0.0, 1: 6600.0, 2: 23000.0, 3: 45000.0}[params.vento_band]
+        uplift = round((comp + vento) * (params.acas_uplift_pct / 100.0), 2)
+        total = round(basic + comp + vento + uplift, 2)
+        data["schedule_of_loss"] = {
+            "basic_award_gbp": basic,
+            "compensatory_loss_gbp": comp,
+            "vento_award_gbp": vento,
+            "acas_uplift_gbp": uplift,
+            "total_gbp": total,
+        }
+        sol_line = f"\n• Schedule of Loss Total: £{total:,.2f} (Basic £{basic:,.2f} + Comp £{comp:,.2f} + Vento £{vento:,.2f} + ACAS £{uplift:,.2f})"
+
+    text = f"Custody Seal {data['seal_short']} for {params.doc_id}\n• SHA-256: {digest}\n• Timestamp: {ts}{sol_line}"
+    return out(text, data, params.output)
+
+
 def _run() -> None:
     import uvicorn
 
