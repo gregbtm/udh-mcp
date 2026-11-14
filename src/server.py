@@ -1087,6 +1087,62 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
     return out(text, data, params.output)
 
 
+class ExtractInput(BaseModel):
+    text: str = Field(..., min_length=1, description="Document text or Markdown to extract metadata from.")
+    output: OutputMode = OutputMode.TEXT
+
+
+@server.tool(
+    name="udh_extract",
+    description=(
+        "Zero-token deterministic extraction: extracts UK neutral citations, statutes, GBP currency, "
+        "emails, dates, headings, word count, and 64-bit SimHash fingerprint with 0 LLM token burn."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def udh_extract(params: ExtractInput) -> list[TextContent]:
+    import hashlib
+    import re
+
+    src = params.text
+    words = re.findall(r"\S+", src)
+    headings = re.findall(r"^#{1,6}\s+(.+)$", src, flags=re.MULTILINE)
+    case_refs = sorted(set(re.findall(r"\[\d{4}\]\s+(?:EWCA\s+Civ|UKEAT|UKSC|EWHC|ICR|IRLR)\s+[\w\d]+", src)))
+    statutes = sorted(set(re.findall(r"(?:Employment Rights Act 1996|Equality Act 2010|ACAS Code|ERA 1996|GDPR|Data Protection Act 2018)", src, flags=re.IGNORECASE)))
+    currencies = sorted(set(re.findall(r"£\s?\d[\d,]*(?:\.\d{1,2})?", src)))
+    emails = sorted(set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", src)))
+    dates = sorted(set(re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b", src)))
+
+    tokens = re.findall(r"[a-z0-9]+", src.lower())
+    shingles = [" ".join(tokens[i : i + 3]) for i in range(len(tokens) - 2)] if len(tokens) >= 3 else tokens
+    vec = [0] * 64
+    for sh in shingles:
+        h = int.from_bytes(hashlib.blake2b(sh.encode("utf-8"), digest_size=8).digest(), "big")
+        for b in range(64):
+            vec[b] += 1 if (h >> b) & 1 else -1
+    fp = sum((1 << b) for b in range(64) if vec[b] > 0)
+
+    data = {
+        "word_count": len(words),
+        "heading_count": len(headings),
+        "case_refs": case_refs,
+        "uk_statutes": statutes,
+        "currency_gbp": currencies,
+        "emails": emails,
+        "dates": dates,
+        "simhash64": f"0x{fp:016x}",
+        "tokens_burned": 0,
+    }
+    text = (
+        f"Zero-Token Extract ({len(words)} words, SimHash {data['simhash64']})\n"
+        f"• Citations: {', '.join(case_refs) or 'None'}\n"
+        f"• Statutes: {', '.join(statutes) or 'None'}\n"
+        f"• Currency: {', '.join(currencies) or 'None'}\n"
+        f"• Dates: {', '.join(dates) or 'None'}"
+    )
+    return out(text, data, params.output)
+
+
 def _run() -> None:
     import uvicorn
 
