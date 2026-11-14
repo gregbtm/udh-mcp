@@ -43,6 +43,12 @@ jobs:
         working-directory: src
         run: python test_tool_registration.py
 
+      - name: Dependency vulnerability audit (advisory)
+        continue-on-error: true
+        run: |
+          pip install --quiet pip-audit
+          pip-audit -r requirements.lock.txt --progress-spinner off
+
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
@@ -77,6 +83,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+          provenance: mode=max
+          sbom: true
 
       - name: Trigger udh-mcp auto-redeploy
         if: github.event_name != 'pull_request'
@@ -92,3 +100,13 @@ jobs:
             2*) echo "fired: udh-mcp (HTTP $code)" ;;
             *) echo "::error title=Redeploy failed::udh-mcp webhook returned HTTP $code"; exit 1 ;;
           esac
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          {
+            echo "### UDH MCP CI/CD"
+            echo "- Event: \`${{ github.event_name }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Image: \`${{ env.IMAGE }}:sha-${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
