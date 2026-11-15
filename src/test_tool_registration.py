@@ -26,6 +26,7 @@ EXPECTED_TOOLS = {
     "udh_tags", "udh_fleet",
     "udh_extract", "udh_bundle_seal",
     "udh_dictionary", "udh_updates",
+    "udh_setup", "udh_scheduler",
 }
 
 failed = []
@@ -496,6 +497,26 @@ async def main() -> None:
         core.UDH_BACKEND_MODE = _old_mode
         core.UDH_PREFER_NATIVE = _old_pref
         core.UDH_DASHBOARD_URL = _old_dash
+
+    # udh_setup & udh_scheduler (Option E Stage 2 + easy setup)
+    r = await server.udh_setup(server.SetupIn(action="connect_guide"), _FakeCtx())
+    check("udh_setup connect_guide returns client config & endpoint", "udh.nasmatrix.app/mcp" in r and "mcpServers" in r)
+
+    r = await server.udh_setup(server.SetupIn(action="quickstart"), _FakeCtx())
+    check("udh_setup quickstart returns 21-tool cheat sheet", "udh_scheduler" in r and "udh_dashboard" in r)
+
+    restricted = ctx_with_scopes("read")
+    try:
+        r = await server.udh_scheduler(server.SchedulerIn(action="run", job_id="wf08_health_digest", dry_run=False, confirm=True), _FakeCtx())
+        check("udh_scheduler run refuses a token without 'sync' scope", "sync" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted)
+
+    r = await server.udh_scheduler(server.SchedulerIn(action="run", job_id="wf08_health_digest", dry_run=False, confirm=False), _FakeCtx())
+    check("udh_scheduler live run requires confirm=true", "Safety gate" in r and "confirm=true" in r)
+
+    r = await server.udh_scheduler(server.SchedulerIn(action="toggle", job_id="wf12_drift_scanner", enabled=False, confirm=False), _FakeCtx())
+    check("udh_scheduler toggle previews without mutating when confirm=false", "Dry-run preview" in r)
 
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:

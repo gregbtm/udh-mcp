@@ -1286,6 +1286,173 @@ async def udh_updates(params: UpdatesIn, ctx: Context) -> str:
     return out(text, data, params.output)
 
 
+class SetupIn(BaseModel):
+    model_config = M
+    action: str = Field(
+        "status",
+        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (21-tool cheat sheet).",
+    )
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+
+
+@server.tool(name="udh_setup", title="UDH MCP Setup, Connection Guide & Quickstart", annotations=RD)
+@_logged_tool
+async def udh_setup(params: SetupIn, ctx: Context) -> str:
+    """Inspect udh-mcp connection settings, Option E migration status, and
+    generate ready-to-paste MCP client configs and a 21-tool quickstart guide.
+    Requires 'read' scope.
+    """
+    if not _has_scope("read"):
+        return "This token isn't scoped for udh_setup — needs 'read' (or '*')."
+
+    import json
+    act = params.action.strip().lower()
+    if act == "connect_guide":
+        guide = {
+            "public_endpoint": os.getenv("UDH_PUBLIC_URL", "https://udh.nasmatrix.app").rstrip("/") + "/mcp",
+            "local_host_endpoint": f"http://127.0.0.1:{os.getenv('UDH_MCP_PORT', '12021')}/mcp",
+            "transport": "streamable-http",
+            "auth_header": "Authorization: Bearer <UDH_AUTH_TOKEN>",
+            "scopes": {
+                "read": "udh_dashboard, udh_query, udh_dictionary, udh_setup, udh_fleet, udh_extract, udh_bundle_seal, udh_updates(check_*), udh_scheduler(status)",
+                "sync": "All read tools + udh_sync, udh_targets, udh_control, udh_health, udh_config, udh_templates, udh_simulate, udh_checkpoint, udh_tokens, udh_tags, udh_updates(trigger_update), udh_scheduler(run/toggle)",
+                "admin": "All sync tools + udh_conflicts, udh_lifecycle (destructive operations)",
+            },
+            "antigravity_or_cursor_mcp_config": {
+                "mcpServers": {
+                    "udh-mcp": {
+                        "serverUrl": "https://udh.nasmatrix.app/mcp",
+                        "headers": {"Authorization": "Bearer ${UDH_AUTH_TOKEN}"},
+                    }
+                }
+            },
+            "env_vars_for_option_e_native": {
+                "UDH_DASHBOARD_URL": "http://127.0.0.1:12015",
+                "UDH_BACKEND_MODE": "native",
+                "UDH_PREFER_NATIVE": "true",
+            },
+        }
+        return out(json.dumps(guide, indent=2), guide, params.output)
+
+    if act == "quickstart":
+        sheet = {
+            "Read & Inspect (safe, no mutations)": [
+                "udh_dashboard() -> Live doc counts, targets, conflicts, quarantine",
+                "udh_query(kind='search_documents', query='...') -> Search canonical docs",
+                "udh_dictionary(resource='error_code', query='UDH-004') -> Error & schema lookup",
+                "udh_fleet(action='get_status') -> Concurrent container latency probe",
+                "udh_setup(action='status|connect_guide') -> Connection & migration status",
+            ],
+            "Stage 2 Scheduler & Safe Previews (dry_run=true by default)": [
+                "udh_scheduler(action='status') -> List 5 Stage 2 Python cron jobs",
+                "udh_scheduler(action='run', job_id='wf08_health_digest', dry_run=true) -> Safe preview",
+                "udh_simulate(scenario_key='et_witness_statement') -> 5-stage pipeline dry-run",
+                "udh_updates(action='check_updates') -> Check GitHub vs running build",
+            ],
+            "Sync & Control (requires 'sync' scope; confirm=true for writes)": [
+                "udh_control(paused=true) -> Emergency global pause",
+                "udh_targets(target_id='trilium', enabled=true) -> Toggle a target",
+                "udh_sync(action='scan_drift') -> Trigger drift scan",
+            ],
+            "Destructive / Admin (requires 'admin' scope + confirm=true)": [
+                "udh_conflicts(...) -> Resolve document conflict",
+                "udh_lifecycle(action='rollback|purge_ingested', confirm=true) -> Restore or purge",
+            ],
+        }
+        return out(json.dumps(sheet, indent=2), sheet, params.output)
+
+    # Default: 'status'
+    ok_mig, _, mig_data = await core.dashboard_api("/api/migration/status")
+    ok_ver, _, ver_data = await core.dashboard_api("/api/version")
+    status_payload = {
+        "mcp_backend_mode": core.UDH_BACKEND_MODE,
+        "mcp_prefer_native": core.UDH_PREFER_NATIVE,
+        "dashboard_url": core.UDH_DASHBOARD_URL,
+        "env_configured": {
+            "UDH_AUTH_TOKEN": bool(os.getenv("UDH_AUTH_TOKEN")),
+            "UDH_AUTH_TOKEN_READONLY": bool(os.getenv("UDH_AUTH_TOKEN_READONLY")),
+            "WF07_URL": bool(core.WF07_URL),
+            "WF14_URL": bool(core.WF14_URL),
+            "WF16_URL": bool(core.WF16_URL),
+        },
+        "dashboard_reachable": ok_mig or ok_ver,
+        "dashboard_version": ver_data if ok_ver else None,
+        "migration_status": mig_data if ok_mig else None,
+    }
+    return out(json.dumps(status_payload, indent=2, default=str), status_payload, params.output)
+
+
+class SchedulerIn(BaseModel):
+    model_config = M
+    action: str = Field("status", description="'status' | 'run' | 'toggle'.")
+    job_id: Optional[str] = Field(
+        None,
+        description="Stage 2 job ID: wf05a_inbound_sync, wf05b_outbound_sync, wf08_health_digest, wf12_drift_scanner, wf20_silent_drift_sweeper.",
+    )
+    dry_run: bool = Field(True, description="Defaults to True for safe preview. Pass dry_run=false + confirm=true to execute.")
+    enabled: Optional[bool] = Field(None, description="Required when action='toggle'.")
+    confirm: bool = Field(False, description="Required (true) when action='run' with dry_run=false, or action='toggle'.")
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+
+
+@server.tool(name="udh_scheduler", title="UDH Stage 2 Python Scheduler Control", annotations=WR)
+@_logged_tool
+async def udh_scheduler(params: SchedulerIn, ctx: Context) -> str:
+    """Inspect, dry-run, execute, or toggle Option E Stage 2 Python cron jobs
+    (replacing n8n wf05a, wf05b, wf08/08b, wf12, wf20).
+    'status' requires 'read' scope; 'run' and 'toggle' require 'sync' scope.
+    Live execution (dry_run=false) and 'toggle' require confirm=true.
+    """
+    act = params.action.strip().lower()
+    if act == "status":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_scheduler status — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/stage2/scheduler")
+        if not ok:
+            return f"Stage 2 scheduler status failed: {text}"
+        return out(text, data, params.output)
+
+    if not _has_scope("sync"):
+        return f"This token isn't scoped for udh_scheduler '{act}' — needs 'sync' (or '*')."
+
+    if not params.job_id:
+        return (
+            "job_id is required. Valid Stage 2 jobs: wf05a_inbound_sync, wf05b_outbound_sync, "
+            "wf08_health_digest, wf12_drift_scanner, wf20_silent_drift_sweeper."
+        )
+
+    if act == "toggle":
+        if params.enabled is None:
+            return "enabled (true/false) is required when action='toggle'."
+        if not params.confirm:
+            return f"Dry-run preview: would set Stage 2 job '{params.job_id}' enabled={params.enabled}. Pass confirm=true to execute."
+        ok, text, data = await core.dashboard_api(
+            "/api/stage2/scheduler/toggle",
+            method="POST",
+            json_body={"job_id": params.job_id, "enabled": params.enabled},
+        )
+        if not ok:
+            return f"Stage 2 scheduler toggle failed: {text}"
+        return out(text, data, params.output)
+
+    if act == "run":
+        if not params.dry_run and not params.confirm:
+            return (
+                f"Safety gate: live execution of '{params.job_id}' (dry_run=false) requires confirm=true. "
+                "Omit dry_run=false (defaults to dry_run=true) for a safe preview."
+            )
+        ok, text, data = await core.dashboard_api(
+            "/api/stage2/scheduler/run",
+            method="POST",
+            json_body={"job_id": params.job_id, "dry_run": params.dry_run},
+        )
+        if not ok:
+            return f"Stage 2 scheduler run failed: {text}"
+        return out(text, data, params.output)
+
+    return f"Unknown action '{params.action}'. Valid actions: 'status', 'run', 'toggle'."
+
+
 def _run() -> None:
     import uvicorn
 
