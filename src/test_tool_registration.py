@@ -539,6 +539,62 @@ async def main() -> None:
     finally:
         auth_context_var.reset(restricted_setup)
 
+    # Front-facing runtime settings via udh_config
+    restricted_rt = ctx_with_scopes("sync")
+    try:
+        r = await server.udh_config(server.ConfigIn(action="get_runtime_settings"), _FakeCtx())
+        check("udh_config get_runtime_settings refuses a token without 'read' scope", "read" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted_rt)
+
+    fake_rt = _FakeHTTP()
+    fake_rt.get_resp = _Resp(200, {"ok": True, "backend_mode": "strangler", "native_write_targets": ["trilium"]})
+
+    class _ShimRT:
+        AsyncClient = staticmethod(lambda *a, **k: fake_rt)
+
+    _oh_rt = core.httpx
+    _old_rt_dash = core.UDH_DASHBOARD_URL
+    core.httpx = _ShimRT
+    core.UDH_DASHBOARD_URL = "https://udh-dashboard.test"
+    try:
+        read_rt = ctx_with_scopes("read")
+        try:
+            r = await server.udh_config(server.ConfigIn(action="get_runtime_settings"), _FakeCtx())
+            check("udh_config get_runtime_settings queries /api/settings/runtime",
+                  len(fake_rt.calls["gets"]) == 1
+                  and fake_rt.calls["gets"][0][0] == "https://udh-dashboard.test/api/settings/runtime"
+                  and "strangler" in r)
+        finally:
+            auth_context_var.reset(read_rt)
+
+        r = await server.udh_config(
+            server.ConfigIn(action="update_runtime_settings", settings={"backend_mode": "native"}, confirm=False),
+            _FakeCtx(),
+        )
+        check("udh_config update_runtime_settings previews when confirm=false", "confirm=true" in r and fake_rt.calls["posts"] == [])
+
+        sync_rt = ctx_with_scopes("sync")
+        try:
+            r = await server.udh_config(
+                server.ConfigIn(action="update_runtime_settings", settings={"backend_mode": "native", "token_daily_budget": 200000}, confirm=True),
+                _FakeCtx(),
+            )
+            check("udh_config update_runtime_settings posts to /api/settings/runtime",
+                  len(fake_rt.calls["posts"]) == 1
+                  and fake_rt.calls["posts"][0][0] == "https://udh-dashboard.test/api/settings/runtime"
+                  and fake_rt.calls["posts"][0][2]["token_daily_budget"] == 200000)
+
+            r = await server.udh_config(server.ConfigIn(action="reset_runtime_settings", confirm=True), _FakeCtx())
+            check("udh_config reset_runtime_settings posts to /api/settings/runtime/reset",
+                  len(fake_rt.calls["posts"]) == 2
+                  and fake_rt.calls["posts"][1][0] == "https://udh-dashboard.test/api/settings/runtime/reset")
+        finally:
+            auth_context_var.reset(sync_rt)
+    finally:
+        core.httpx = _oh_rt
+        core.UDH_DASHBOARD_URL = _old_rt_dash
+
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:
         sys.exit(1)

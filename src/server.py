@@ -579,48 +579,96 @@ async def udh_health(params: HealthIn, ctx: Context) -> str:
 
 class ConfigIn(BaseModel):
     model_config = M
-    action: str = Field(..., description="update_hub_config | update_target_config")
+    action: str = Field(..., description=(
+        "update_hub_config | update_target_config | get_runtime_settings | "
+        "update_runtime_settings | reset_runtime_settings"))
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
-    confirm: bool = Field(False, description="Required.")
+    confirm: bool = Field(False, description="Required for write actions (all except get_runtime_settings).")
     target_id: Optional[str] = Field(None, description="update_target_config (required): which target_config row, e.g. 'trilium'.")
-    field: str = Field(..., description=(
-        "update_hub_config: one of legal_mode/dry_run/max_global_batch/backup_versions_to_keep/"
+    field: Optional[str] = Field(None, description=(
+        "update_hub_config: one of legal_mode/global_pause/dry_run/auto_enrich/"
+        "default_chunk_size/max_global_batch/backup_versions_to_keep/"
         "snapshot_keep_count/quarantine_after_errors/lock_timeout_seconds/"
         "lock_retry_count/write_verification/soft_delete_only/echo_suppression/"
         "conflict_timeout_hours/pre_bulk_snapshot/circuit_breaker_threshold/"
-        "default_source_of_truth (global_pause is deliberately excluded -- use "
-        "udh_control instead, to keep one control path for it). "
-        "update_target_config: one of enabled/sync_direction/endpoint/"
-        "credential_ref/database_id/source_priority/conflict_action/"
-        "max_batch_size/write_verification/circuit_breaker_threshold/dry_run/"
-        "poll_interval_mins/conflict_timeout_hours/inbound_workflow_id/"
-        "outbound_workflow_id/blocked_sensitivity_levels (target_id itself, "
-        "inbound_enabled/outbound_enabled -- use udh_targets instead -- and "
-        "last_inbound_check are excluded)."))
-    value: Any = Field(..., description="The new value for 'field'. An unrecognised field name is refused by WF-07's own Guard node before any write.")
+        "default_source_of_truth. "
+        "update_target_config: one of enabled/inbound_enabled/outbound_enabled/"
+        "mode/sync_direction/endpoint/credential_ref/database_id/source_priority/"
+        "conflict_action/max_batch_size/write_verification/circuit_breaker_threshold/"
+        "dry_run/poll_interval_mins/conflict_timeout_hours/inbound_workflow_id/"
+        "outbound_workflow_id/blocked_sensitivity_levels."))
+    value: Any = Field(None, description="The new value for 'field' when updating hub_config or target_config.")
+    settings: Optional[dict[str, Any]] = Field(None, description=(
+        "update_runtime_settings (required): dictionary of runtime settings to apply "
+        "(backend_mode, stage2_scheduler_armed, native_write_targets, stage2_intervals, "
+        "stage2_job_toggles, token_daily_budget, circuit_breaker_failure_threshold, "
+        "circuit_breaker_open_seconds, mcp_rate_limit_per_min, ntfy_alerts_enabled, "
+        "hub_config, target_config)."))
 
 
-_CONFIG_ACTIONS = {"update_hub_config", "update_target_config"}
+_CONFIG_ACTIONS = {
+    "update_hub_config",
+    "update_target_config",
+    "get_runtime_settings",
+    "update_runtime_settings",
+    "reset_runtime_settings",
+}
 
 
-@server.tool(name="udh_config", title="UDH Hub & Target Configuration", annotations=WR)
+@server.tool(name="udh_config", title="UDH Hub, Target & Runtime Configuration", annotations=WR)
 @_logged_tool
 async def udh_config(params: ConfigIn, ctx: Context) -> str:
-    """Update one field of hub_config (global settings) or one
-    target_config row (per-target settings), via WF-07. Added 2026-10-12
-    server-side in matrix-homelab. Structurally verified there, not yet
-    confirmed against a live NAS/n8n instance as of 2026-10-13 -- the
-    first real use of either action should check the field's new value
-    via udh_dashboard afterward rather than trusting this call's own
-    response. 'sync' scope + confirm=true (this changes configuration,
-    not document data, so it doesn't need 'admin').
+    """Update hub_config (18 global settings), target_config (19 per-target settings),
+    or live Option E & guardrail runtime settings (backend_mode, stage2_scheduler_armed,
+    native_write_targets, stage2_intervals, token_daily_budget, circuit breakers,
+    mcp_rate_limit_per_min, ntfy_alerts_enabled) without container restarts.
+
+    get_runtime_settings requires 'read' scope and no confirm.
+    All mutating actions require 'sync' scope and confirm=true.
     """
     if params.action not in _CONFIG_ACTIONS:
         return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_CONFIG_ACTIONS))}"
-    if params.action == "update_target_config" and not params.target_id:
-        return "update_target_config requires target_id."
+
+    if params.action == "get_runtime_settings":
+        if not _has_scope("read"):
+            return f"This token isn't scoped for udh_config action='{params.action}' — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/settings/runtime")
+        if ok:
+            return out(text, data, params.output)
+        import json
+        fallback = {
+            "offline_fallback": True,
+            "error": text,
+            "backend_mode": core.UDH_BACKEND_MODE,
+            "prefer_native": core.UDH_PREFER_NATIVE,
+            "dashboard_url": core.UDH_DASHBOARD_URL,
+        }
+        return out(json.dumps(fallback, indent=2), fallback, params.output)
+
     if not _has_scope("sync"):
         return f"This token isn't scoped for udh_config action='{params.action}' — needs 'sync' (or '*')."
+
+    if params.action == "update_runtime_settings":
+        if not params.settings or not isinstance(params.settings, dict):
+            return "update_runtime_settings requires a non-empty 'settings' dictionary."
+        if not params.confirm:
+            text = f"Would update_runtime_settings with {params.settings}. Set confirm=true to proceed."
+            return out(text, preview("udh_config", resource="runtime_settings", payload=params.settings), params.output)
+        ok, text, data = await core.dashboard_api("/api/settings/runtime", method="POST", json_body=params.settings)
+        return out(text, data, params.output) if ok else f"Failed to update runtime settings: {text}"
+
+    if params.action == "reset_runtime_settings":
+        if not params.confirm:
+            text = "Would reset_runtime_settings to environment defaults. Set confirm=true to proceed."
+            return out(text, preview("udh_config", resource="runtime_settings", payload={"reset": True}), params.output)
+        ok, text, data = await core.dashboard_api("/api/settings/runtime/reset", method="POST", json_body={})
+        return out(text, data, params.output) if ok else f"Failed to reset runtime settings: {text}"
+
+    if not params.field or params.value is None:
+        return f"{params.action} requires both 'field' and 'value'."
+    if params.action == "update_target_config" and not params.target_id:
+        return "update_target_config requires target_id."
+
     payload: dict = {"field": params.field, "value": params.value}
     if params.target_id:
         payload["target_id"] = params.target_id
