@@ -49,8 +49,8 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 > **Tip:** Once connected, call `udh_setup(action="status")` to verify env configuration and live `udh-dashboard` reachability, or `udh_setup(action="quickstart")` for an interactive cheat sheet.
 
 ### 4. Scoped Token Tiers
-- **`read`**: `udh_dashboard`, `udh_query`, `udh_dictionary`, `udh_setup`, `udh_fleet`, `udh_extract`, `udh_bundle_seal`, `udh_updates(check_*)`, `udh_scheduler(status)`
-- **`sync`**: All `read` tools + `udh_sync`, `udh_targets`, `udh_control`, `udh_health`, `udh_config`, `udh_templates`, `udh_simulate`, `udh_checkpoint`, `udh_tokens`, `udh_tags`, `udh_updates(trigger_update)`, `udh_scheduler(run/toggle)`
+- **`read`**: `udh_dashboard`, `udh_query`, `udh_dictionary`, `udh_setup`, `udh_fleet`, `udh_extract`, `udh_bundle_seal`, `udh_updates(check_*)`, `udh_scheduler(status)`, `udh_config(get_runtime_settings)`
+- **`sync`**: All `read` tools + `udh_sync`, `udh_targets`, `udh_control`, `udh_health`, `udh_config` (`update_*`, `reset_runtime_settings`), `udh_templates`, `udh_simulate`, `udh_checkpoint`, `udh_tokens`, `udh_tags`, `udh_updates(trigger_update)`, `udh_scheduler(run/toggle)`
 - **`admin`** (or `*`): All `sync` tools + `udh_conflicts`, `udh_lifecycle` (destructive rollback/delete/purge)
 
 ---
@@ -87,7 +87,7 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 - `udh_targets`: Per-target control (`set_target_enabled`).
 - `udh_control`: Emergency brake (`set_global_pause`).
 - `udh_health`: On-demand health/integrity checks (`check_health`, `check_integrity`).
-- `udh_config`: Hub/target configuration tuning (`update_hub_config`, `update_target_config`).
+- `udh_config`: Full hub/target & live Option E runtime configuration (`update_hub_config` across all 18 hub fields, `update_target_config` across all 19 target fields, `get_runtime_settings`, `update_runtime_settings`, `reset_runtime_settings`).
 - `udh_templates`: Ingestion template CRUD (`list_templates`, `create_template`, `update_template`, `delete_template`, `set_default_template`).
 - `udh_tokens`: Token burn tracking, budget caps, and adaptive fallback to local heuristics.
 - `udh_tags`: Semantic tag clustering, synonym detection, and 1-click taxonomy consolidation.

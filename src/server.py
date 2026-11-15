@@ -1374,8 +1374,8 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
             "transport": "streamable-http",
             "auth_header": "Authorization: Bearer <UDH_AUTH_TOKEN>",
             "scopes": {
-                "read": "udh_dashboard, udh_query, udh_dictionary, udh_setup, udh_fleet, udh_extract, udh_bundle_seal, udh_updates(check_*), udh_scheduler(status)",
-                "sync": "All read tools + udh_sync, udh_targets, udh_control, udh_health, udh_config, udh_templates, udh_simulate, udh_checkpoint, udh_tokens, udh_tags, udh_updates(trigger_update), udh_scheduler(run/toggle)",
+                "read": "udh_dashboard, udh_query, udh_dictionary, udh_setup, udh_fleet, udh_extract, udh_bundle_seal, udh_updates(check_*), udh_scheduler(status), udh_config(get_runtime_settings)",
+                "sync": "All read tools + udh_sync, udh_targets, udh_control, udh_health, udh_config(update_*/reset_*), udh_templates, udh_simulate, udh_checkpoint, udh_tokens, udh_tags, udh_updates(trigger_update), udh_scheduler(run/toggle)",
                 "admin": "All sync tools + udh_conflicts, udh_lifecycle (destructive operations)",
             },
             "antigravity_or_cursor_mcp_config": {
@@ -1412,6 +1412,7 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
             "Sync & Control (requires 'sync' scope; confirm=true for writes)": [
                 "udh_control(paused=true) -> Emergency global pause",
                 "udh_targets(target_id='trilium', enabled=true) -> Toggle a target",
+                "udh_config(action='get_runtime_settings|update_runtime_settings') -> Runtime Option E & hub/target settings",
                 "udh_sync(action='scan_drift') -> Trigger drift scan",
             ],
             "Destructive / Admin (requires 'admin' scope + confirm=true)": [
