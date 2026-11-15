@@ -1338,8 +1338,10 @@ class SetupIn(BaseModel):
     model_config = M
     action: str = Field(
         "status",
-        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (22-tool cheat sheet) | 'parity' (WF-14 vs Postgres diff) | 'cutover_check' (Stage 4 readiness).",
+        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (22-tool cheat sheet) | 'parity' (WF-14 vs Postgres diff) | 'cutover_check' (Stage 4 readiness) | 'bootstrap_pg' (1-click Postgres schema & n8n seeder).",
     )
+    dry_run: bool = Field(True, description="Used by action='bootstrap_pg' (defaults to True for safe preview).")
+    confirm: bool = Field(False, description="Required (true) for action='bootstrap_pg' with dry_run=false.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
@@ -1348,14 +1350,31 @@ class SetupIn(BaseModel):
 async def udh_setup(params: SetupIn, ctx: Context) -> str:
     """Inspect udh-mcp connection settings, Option E migration status, and
     generate ready-to-paste MCP client configs and a 22-tool quickstart guide.
-    Supports 'parity' and 'cutover_check' for Option E Stage 4 verification.
-    Requires 'read' scope.
+    Supports 'parity', 'cutover_check', and 'bootstrap_pg' for Option E cutover.
+    Read-only actions require 'read' scope; live 'bootstrap_pg' (dry_run=false) requires 'sync' scope + confirm=true.
     """
+    import json
+    act = params.action.strip().lower()
+    if act == "bootstrap_pg":
+        if not params.dry_run:
+            if not _has_scope("sync"):
+                return "This token isn't scoped for live udh_setup bootstrap_pg — needs 'sync' (or '*')."
+            if not params.confirm:
+                return "Safety gate: live Postgres schema bootstrap & n8n seeder (dry_run=false) requires confirm=true. Pass dry_run=true for a safe preview."
+        elif not _has_scope("read"):
+            return "This token isn't scoped for udh_setup bootstrap_pg preview — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api(
+            "/api/migration/bootstrap-pg",
+            method="POST",
+            json_body={"dry_run": params.dry_run, "seed_from_n8n": True},
+        )
+        if not ok:
+            return f"Postgres bootstrap failed: {text}"
+        return out(text, data, params.output)
+
     if not _has_scope("read"):
         return "This token isn't scoped for udh_setup — needs 'read' (or '*')."
 
-    import json
-    act = params.action.strip().lower()
     if act == "parity":
         ok, text, data = await core.dashboard_api("/api/migration/parity")
         if not ok:
@@ -1577,6 +1596,14 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
     if act == "dispatch":
         if not params.adapter_id:
             return "adapter_id is required for action='dispatch' (e.g. 'trilium', 'paperless', 'docmost')."
+        dispatch_payload: dict = {}
+        if params.doc_id:
+            dispatch_payload["doc_id"] = params.doc_id
+        if params.title:
+            dispatch_payload["title"] = params.title
+        if params.content is not None:
+            dispatch_payload["content"] = params.content
+            dispatch_payload["write"] = True
         ok, text, data = await core.dashboard_api(
             "/api/stage3/adapters/dispatch",
             method="POST",
@@ -1584,6 +1611,7 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
                 "adapter_id": params.adapter_id,
                 "direction": params.direction,
                 "dry_run": params.dry_run,
+                "payload": dispatch_payload,
             },
         )
         if not ok:

@@ -595,6 +595,60 @@ async def main() -> None:
         core.httpx = _oh_rt
         core.UDH_DASHBOARD_URL = _old_rt_dash
 
+    # Option 1 bootstrap_pg & Option 2 udh_adapters dispatch payload passthrough
+    fake_boot = _FakeHTTP()
+    fake_boot.post_resp = _Resp(200, {"ok": True, "dry_run": True, "tables_to_ensure": ["hub_config"]})
+
+    class _ShimBoot:
+        AsyncClient = staticmethod(lambda *a, **k: fake_boot)
+
+    _oh_b = core.httpx
+    _old_b_dash = core.UDH_DASHBOARD_URL
+    core.httpx = _ShimBoot
+    core.UDH_DASHBOARD_URL = "https://udh-dashboard.test"
+    try:
+        read_b = ctx_with_scopes("read")
+        try:
+            r = await server.udh_setup(server.SetupIn(action="bootstrap_pg", dry_run=True), _FakeCtx())
+            check("udh_setup bootstrap_pg dry_run posts to /api/migration/bootstrap-pg",
+                  len(fake_boot.calls["posts"]) == 1
+                  and fake_boot.calls["posts"][0][0] == "https://udh-dashboard.test/api/migration/bootstrap-pg"
+                  and fake_boot.calls["posts"][0][2]["dry_run"] is True)
+
+            r = await server.udh_setup(server.SetupIn(action="bootstrap_pg", dry_run=False, confirm=True), _FakeCtx())
+            check("udh_setup live bootstrap_pg refuses a token without 'sync' scope",
+                  "sync" in r.lower() and "scoped" in r.lower())
+        finally:
+            auth_context_var.reset(read_b)
+
+        sync_b = ctx_with_scopes("sync")
+        try:
+            r = await server.udh_setup(server.SetupIn(action="bootstrap_pg", dry_run=False, confirm=False), _FakeCtx())
+            check("udh_setup live bootstrap_pg requires confirm=true", "Safety gate" in r and "confirm=true" in r)
+
+            r = await server.udh_adapters(
+                server.AdaptersIn(
+                    action="dispatch",
+                    adapter_id="obsidian",
+                    direction="out",
+                    doc_id="doc-42",
+                    title="Evidence Note",
+                    content="Full text body",
+                    dry_run=False,
+                    confirm=True,
+                ),
+                _FakeCtx(),
+            )
+            check("udh_adapters dispatch forwards payload doc_id/title/content/write",
+                  fake_boot.calls["posts"][-1][0] == "https://udh-dashboard.test/api/stage3/adapters/dispatch"
+                  and fake_boot.calls["posts"][-1][2]["payload"]["doc_id"] == "doc-42"
+                  and fake_boot.calls["posts"][-1][2]["payload"]["write"] is True)
+        finally:
+            auth_context_var.reset(sync_b)
+    finally:
+        core.httpx = _oh_b
+        core.UDH_DASHBOARD_URL = _old_b_dash
+
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:
         sys.exit(1)

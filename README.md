@@ -65,7 +65,7 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 ## Tool Surface (22 Tools)
 
 ### Easy Setup, Docs & Diagnostics
-- `udh_setup`: Live connection/migration check (`status`), client JSON (`connect_guide`), 22-tool cheat sheet (`quickstart`), Shadow Parity Diff (`parity`), and Stage 4 cutover readiness & env recipes (`cutover_check`).
+- `udh_setup`: Live connection/migration check (`status`), client JSON (`connect_guide`), 22-tool cheat sheet (`quickstart`), Shadow Parity Diff (`parity`), Stage 4 cutover readiness & env recipes (`cutover_check`), and 1-click Postgres schema & n8n seeder (`bootstrap_pg`).
 - `udh_dictionary`: Query UDH Data Dictionary schemas (`/api/dictionary`) and 100-item Error/Fallback Catalog (`UDH-001`–`UDH-100`).
 - `udh_fleet`: Concurrent 5-service container fleet health beacon, socket latency probes, and `udh-mcp` version metadata.
 - `udh_updates`: Check UDH Dashboard/ecosystem version (`/api/version`), check GitHub updates (`/api/updates/check`), and trigger redeploy (`confirm=true`).
