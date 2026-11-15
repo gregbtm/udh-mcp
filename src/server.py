@@ -1453,6 +1453,83 @@ async def udh_scheduler(params: SchedulerIn, ctx: Context) -> str:
     return f"Unknown action '{params.action}'. Valid actions: 'status', 'run', 'toggle'."
 
 
+class AdaptersIn(BaseModel):
+    model_config = M
+    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline'.")
+    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch' (e.g. 'trilium', 'paperless', 'obsidian').")
+    direction: str = Field("out", description="'in' or 'out' for action='dispatch'.")
+    doc_id: Optional[str] = Field("doc-preview", description="Document ID for action='pipeline'.")
+    title: Optional[str] = Field("", description="Document title for action='pipeline'.")
+    content: Optional[str] = Field(None, description="Document text/Markdown for action='pipeline'.")
+    targets: Optional[List[str]] = Field(None, description="Optional target adapter IDs for action='pipeline'.")
+    dry_run: bool = Field(True, description="Defaults to True for safe preview. Pass dry_run=false + confirm=true to execute.")
+    confirm: bool = Field(False, description="Required (true) when dry_run=false.")
+    output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+
+
+@server.tool(name="udh_adapters", title="UDH Stage 3 Python Adapters & Pipeline", annotations=WR)
+@_logged_tool
+async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
+    """List, dry-run, or execute Option E Stage 3 native Python target adapters
+    and the 5-stage pipeline (replacing wf01-wf03 and wf04a..wf04l).
+    'list' requires 'read' scope; 'dispatch' and 'pipeline' require 'sync' scope
+    and confirm=true when dry_run=false.
+    """
+    act = params.action.strip().lower()
+    if act == "list":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_adapters list — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/stage3/adapters")
+        if not ok:
+            return f"Stage 3 adapters list failed: {text}"
+        return out(text, data, params.output)
+
+    if not _has_scope("sync"):
+        return f"This token isn't scoped for udh_adapters '{act}' — needs 'sync' (or '*')."
+
+    if not params.dry_run and not params.confirm:
+        return (
+            f"Safety gate: live Stage 3 '{act}' (dry_run=false) requires confirm=true. "
+            "Omit dry_run=false (defaults to dry_run=true) for a safe preview."
+        )
+
+    if act == "dispatch":
+        if not params.adapter_id:
+            return "adapter_id is required for action='dispatch' (e.g. 'trilium', 'paperless', 'docmost')."
+        ok, text, data = await core.dashboard_api(
+            "/api/stage3/adapters/dispatch",
+            method="POST",
+            json_body={
+                "adapter_id": params.adapter_id,
+                "direction": params.direction,
+                "dry_run": params.dry_run,
+            },
+        )
+        if not ok:
+            return f"Stage 3 adapter dispatch failed: {text}"
+        return out(text, data, params.output)
+
+    if act == "pipeline":
+        if not params.content:
+            return "content is required for action='pipeline'."
+        ok, text, data = await core.dashboard_api(
+            "/api/stage3/pipeline/run",
+            method="POST",
+            json_body={
+                "doc_id": params.doc_id or "doc-preview",
+                "title": params.title or "",
+                "content": params.content,
+                "targets": params.targets,
+                "dry_run": params.dry_run,
+            },
+        )
+        if not ok:
+            return f"Stage 3 pipeline run failed: {text}"
+        return out(text, data, params.output)
+
+    return f"Unknown action '{params.action}'. Valid actions: 'list', 'dispatch', 'pipeline'."
+
+
 def _run() -> None:
     import uvicorn
 

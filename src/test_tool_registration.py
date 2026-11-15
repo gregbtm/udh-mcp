@@ -26,7 +26,7 @@ EXPECTED_TOOLS = {
     "udh_tags", "udh_fleet",
     "udh_extract", "udh_bundle_seal",
     "udh_dictionary", "udh_updates",
-    "udh_setup", "udh_scheduler",
+    "udh_setup", "udh_scheduler", "udh_adapters",
 }
 
 failed = []
@@ -517,6 +517,17 @@ async def main() -> None:
 
     r = await server.udh_scheduler(server.SchedulerIn(action="toggle", job_id="wf12_drift_scanner", enabled=False, confirm=False), _FakeCtx())
     check("udh_scheduler toggle previews without mutating when confirm=false", "Dry-run preview" in r)
+
+    # udh_adapters (Option E Stage 3)
+    restricted = ctx_with_scopes("read")
+    try:
+        r = await server.udh_adapters(server.AdaptersIn(action="dispatch", adapter_id="trilium", dry_run=False, confirm=True), _FakeCtx())
+        check("udh_adapters dispatch refuses a token without 'sync' scope", "sync" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted)
+
+    r = await server.udh_adapters(server.AdaptersIn(action="pipeline", content="hello", dry_run=False, confirm=False), _FakeCtx())
+    check("udh_adapters live pipeline requires confirm=true", "Safety gate" in r and "confirm=true" in r)
 
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:

@@ -1,6 +1,6 @@
 # udh-mcp
 
-Standalone MCP server for matrix-homelab's **Universal Document Hub (UDH)** — providing **21 tools** with full parity with UDH Dashboard, Option E Strangler-Fig native backend routing (`/api/native/*`), Stage 2 Python scheduler control (`udh_scheduler`), and zero-config setup helpers (`udh_setup`).
+Standalone MCP server for matrix-homelab's **Universal Document Hub (UDH)** — providing **22 tools** with full parity with UDH Dashboard, Option E Strangler-Fig native backend routing (`/api/native/*`), Stage 2 Python scheduler control (`udh_scheduler`), Stage 3 Python target adapters (`udh_adapters`), and zero-config setup helpers (`udh_setup`).
 
 Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` for the architecture and why.
 
@@ -62,7 +62,7 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 
 ---
 
-## Tool Surface (21 Tools)
+## Tool Surface (22 Tools)
 
 ### Easy Setup, Docs & Diagnostics
 - `udh_setup`: Live connection/migration check (`status`), client JSON (`connect_guide`), and 21-tool cheat sheet (`quickstart`).
@@ -76,8 +76,9 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 - `udh_extract`: Zero-token deterministic extraction (citations, statutes, GBP currency, dates, 64-bit SimHash).
 - `udh_bundle_seal`: Deterministic SHA-256 chain-of-custody seal & UK ET Schedule of Loss calculator.
 
-### Option E Stage 2 Scheduler & Safe Simulations
+### Option E Stage 2 Scheduler, Stage 3 Adapters & Safe Simulations
 - `udh_scheduler`: Inspect (`status`), safely preview (`run` with `dry_run=true` default), execute (`dry_run=false, confirm=true`), or toggle Stage 2 Python cron jobs (`wf05a_inbound_sync`, `wf05b_outbound_sync`, `wf08_health_digest`, `wf12_drift_scanner`, `wf20_silent_drift_sweeper`).
+- `udh_adapters`: List (`list`), safely preview (`dispatch`/`pipeline` with `dry_run=true` default), or execute (`dry_run=false, confirm=true`) Stage 3 native Python target adapters (`trilium`, `obsidian`, `notion`, `nocodb`, `paperless`, `affine`, `gmail`, `neo4j`, `meilisearch`, `fastmail`, `firecrawl`, `tasktrove`, `docmost`).
 - `udh_simulate`: 5-stage dry-run pipeline simulation (Extract -> SimHash 64-bit -> Enrich -> Reconcile -> Outbound).
 - `udh_checkpoint`: Instant pipeline rollback checkpoints (`create`, `list`, `restore`, `delete`).
 
