@@ -1290,7 +1290,7 @@ class SetupIn(BaseModel):
     model_config = M
     action: str = Field(
         "status",
-        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (21-tool cheat sheet).",
+        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (22-tool cheat sheet) | 'parity' (WF-14 vs Postgres diff) | 'cutover_check' (Stage 4 readiness).",
     )
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
@@ -1299,7 +1299,8 @@ class SetupIn(BaseModel):
 @_logged_tool
 async def udh_setup(params: SetupIn, ctx: Context) -> str:
     """Inspect udh-mcp connection settings, Option E migration status, and
-    generate ready-to-paste MCP client configs and a 21-tool quickstart guide.
+    generate ready-to-paste MCP client configs and a 22-tool quickstart guide.
+    Supports 'parity' and 'cutover_check' for Option E Stage 4 verification.
     Requires 'read' scope.
     """
     if not _has_scope("read"):
@@ -1307,6 +1308,17 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
 
     import json
     act = params.action.strip().lower()
+    if act == "parity":
+        ok, text, data = await core.dashboard_api("/api/migration/parity")
+        if not ok:
+            return f"Shadow parity diff failed: {text}"
+        return out(text, data, params.output)
+
+    if act == "cutover_check":
+        ok, text, data = await core.dashboard_api("/api/stage4/cutover-check")
+        if not ok:
+            return f"Stage 4 cutover check failed: {text}"
+        return out(text, data, params.output)
     if act == "connect_guide":
         guide = {
             "public_endpoint": os.getenv("UDH_PUBLIC_URL", "https://udh.nasmatrix.app").rstrip("/") + "/mcp",
@@ -1455,8 +1467,8 @@ async def udh_scheduler(params: SchedulerIn, ctx: Context) -> str:
 
 class AdaptersIn(BaseModel):
     model_config = M
-    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline'.")
-    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch' (e.g. 'trilium', 'paperless', 'obsidian').")
+    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline' | 'bridges' | 'run_bridge'.")
+    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch' (e.g. 'trilium', 'paperless') or bridge ID for action='run_bridge'.")
     direction: str = Field("out", description="'in' or 'out' for action='dispatch'.")
     doc_id: Optional[str] = Field("doc-preview", description="Document ID for action='pipeline'.")
     title: Optional[str] = Field("", description="Document title for action='pipeline'.")
@@ -1467,13 +1479,13 @@ class AdaptersIn(BaseModel):
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
-@server.tool(name="udh_adapters", title="UDH Stage 3 Python Adapters & Pipeline", annotations=WR)
+@server.tool(name="udh_adapters", title="UDH Stage 3/4 Python Adapters, Pipeline & Bridges", annotations=WR)
 @_logged_tool
 async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
-    """List, dry-run, or execute Option E Stage 3 native Python target adapters
-    and the 5-stage pipeline (replacing wf01-wf03 and wf04a..wf04l).
-    'list' requires 'read' scope; 'dispatch' and 'pipeline' require 'sync' scope
-    and confirm=true when dry_run=false.
+    """List, dry-run, or execute Option E Stage 3 native Python target adapters,
+    the 5-stage pipeline, and Stage 4 legacy n8n bridges.
+    'list'/'bridges' require 'read' scope; 'dispatch'/'pipeline'/'run_bridge'
+    require 'sync' scope and confirm=true when dry_run=false.
     """
     act = params.action.strip().lower()
     if act == "list":
@@ -1484,14 +1496,34 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
             return f"Stage 3 adapters list failed: {text}"
         return out(text, data, params.output)
 
+    if act == "bridges":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_adapters bridges — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/stage4/bridges")
+        if not ok:
+            return f"Stage 4 bridges list failed: {text}"
+        return out(text, data, params.output)
+
     if not _has_scope("sync"):
         return f"This token isn't scoped for udh_adapters '{act}' — needs 'sync' (or '*')."
 
     if not params.dry_run and not params.confirm:
         return (
-            f"Safety gate: live Stage 3 '{act}' (dry_run=false) requires confirm=true. "
+            f"Safety gate: live Stage 3/4 '{act}' (dry_run=false) requires confirm=true. "
             "Omit dry_run=false (defaults to dry_run=true) for a safe preview."
         )
+
+    if act == "run_bridge":
+        if not params.adapter_id:
+            return "adapter_id (bridge_id) is required for action='run_bridge' (e.g. 'legal_phase1_trilium_import')."
+        ok, text, data = await core.dashboard_api(
+            "/api/stage4/bridges/run",
+            method="POST",
+            json_body={"bridge_id": params.adapter_id, "dry_run": params.dry_run},
+        )
+        if not ok:
+            return f"Stage 4 bridge run failed: {text}"
+        return out(text, data, params.output)
 
     if act == "dispatch":
         if not params.adapter_id:

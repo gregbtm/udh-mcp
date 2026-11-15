@@ -65,7 +65,7 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 ## Tool Surface (22 Tools)
 
 ### Easy Setup, Docs & Diagnostics
-- `udh_setup`: Live connection/migration check (`status`), client JSON (`connect_guide`), and 21-tool cheat sheet (`quickstart`).
+- `udh_setup`: Live connection/migration check (`status`), client JSON (`connect_guide`), 22-tool cheat sheet (`quickstart`), Shadow Parity Diff (`parity`), and Stage 4 cutover readiness & env recipes (`cutover_check`).
 - `udh_dictionary`: Query UDH Data Dictionary schemas (`/api/dictionary`) and 100-item Error/Fallback Catalog (`UDH-001`–`UDH-100`).
 - `udh_fleet`: Concurrent 5-service container fleet health beacon, socket latency probes, and `udh-mcp` version metadata.
 - `udh_updates`: Check UDH Dashboard/ecosystem version (`/api/version`), check GitHub updates (`/api/updates/check`), and trigger redeploy (`confirm=true`).
@@ -76,9 +76,9 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 - `udh_extract`: Zero-token deterministic extraction (citations, statutes, GBP currency, dates, 64-bit SimHash).
 - `udh_bundle_seal`: Deterministic SHA-256 chain-of-custody seal & UK ET Schedule of Loss calculator.
 
-### Option E Stage 2 Scheduler, Stage 3 Adapters & Safe Simulations
+### Option E Stage 2 Scheduler, Stage 3/4 Adapters & Safe Simulations
 - `udh_scheduler`: Inspect (`status`), safely preview (`run` with `dry_run=true` default), execute (`dry_run=false, confirm=true`), or toggle Stage 2 Python cron jobs (`wf05a_inbound_sync`, `wf05b_outbound_sync`, `wf08_health_digest`, `wf12_drift_scanner`, `wf20_silent_drift_sweeper`).
-- `udh_adapters`: List (`list`), safely preview (`dispatch`/`pipeline` with `dry_run=true` default), or execute (`dry_run=false, confirm=true`) Stage 3 native Python target adapters (`trilium`, `obsidian`, `notion`, `nocodb`, `paperless`, `affine`, `gmail`, `neo4j`, `meilisearch`, `fastmail`, `firecrawl`, `tasktrove`, `docmost`).
+- `udh_adapters`: List (`list`), safely preview (`dispatch`/`pipeline` with `dry_run=true` default), or execute (`dry_run=false, confirm=true`) Stage 3 native Python target adapters (`trilium`, `obsidian`, `notion`, `nocodb`, `paperless`, `affine`, `gmail`, `neo4j`, `meilisearch`, `fastmail`, `firecrawl`, `tasktrove`, `docmost`), as well as Stage 4 legacy n8n bridges (`bridges`, `run_bridge`).
 - `udh_simulate`: 5-stage dry-run pipeline simulation (Extract -> SimHash 64-bit -> Enrich -> Reconcile -> Outbound).
 - `udh_checkpoint`: Instant pipeline rollback checkpoints (`create`, `list`, `restore`, `delete`).
 

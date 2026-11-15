@@ -529,6 +529,16 @@ async def main() -> None:
     r = await server.udh_adapters(server.AdaptersIn(action="pipeline", content="hello", dry_run=False, confirm=False), _FakeCtx())
     check("udh_adapters live pipeline requires confirm=true", "Safety gate" in r and "confirm=true" in r)
 
+    r = await server.udh_adapters(server.AdaptersIn(action="run_bridge", adapter_id="legal_phase1_trilium_import", dry_run=False, confirm=False), _FakeCtx())
+    check("udh_adapters live run_bridge requires confirm=true", "Safety gate" in r and "confirm=true" in r)
+
+    restricted_setup = ctx_with_scopes("sync")
+    try:
+        r = await server.udh_setup(server.SetupIn(action="cutover_check"), _FakeCtx())
+        check("udh_setup cutover_check refuses a token without 'read' scope", "read" in r.lower() and "scoped" in r.lower())
+    finally:
+        auth_context_var.reset(restricted_setup)
+
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:
         sys.exit(1)
