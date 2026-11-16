@@ -655,6 +655,8 @@ async def udh_config(params: ConfigIn, ctx: Context) -> str:
             text = f"Would update_runtime_settings with {params.settings}. Set confirm=true to proceed."
             return out(text, preview("udh_config", resource="runtime_settings", payload=params.settings), params.output)
         ok, text, data = await core.dashboard_api("/api/settings/runtime", method="POST", json_body=params.settings)
+        if ok and "backend_mode" in params.settings:
+            core.set_runtime_mode(params.settings.get("backend_mode"))
         return out(text, data, params.output) if ok else f"Failed to update runtime settings: {text}"
 
     if params.action == "reset_runtime_settings":
@@ -662,6 +664,8 @@ async def udh_config(params: ConfigIn, ctx: Context) -> str:
             text = "Would reset_runtime_settings to environment defaults. Set confirm=true to proceed."
             return out(text, preview("udh_config", resource="runtime_settings", payload={"reset": True}), params.output)
         ok, text, data = await core.dashboard_api("/api/settings/runtime/reset", method="POST", json_body={})
+        if ok:
+            core.set_runtime_mode(None)
         return out(text, data, params.output) if ok else f"Failed to reset runtime settings: {text}"
 
     if not params.field or params.value is None:
@@ -1535,13 +1539,14 @@ async def udh_scheduler(params: SchedulerIn, ctx: Context) -> str:
 
 class AdaptersIn(BaseModel):
     model_config = M
-    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline' | 'bridges' | 'run_bridge'.")
-    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch' (e.g. 'trilium', 'paperless') or bridge ID for action='run_bridge'.")
+    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline' | 'bridges' | 'run_bridge' | 'dlq' | 'replay_dlq' | 'webhook_ingest'.")
+    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch'/'dlq'/'replay_dlq' (e.g. 'trilium', 'paperless') or bridge ID for action='run_bridge'.")
     direction: str = Field("out", description="'in' or 'out' for action='dispatch'.")
-    doc_id: Optional[str] = Field("doc-preview", description="Document ID for action='pipeline'.")
-    title: Optional[str] = Field("", description="Document title for action='pipeline'.")
-    content: Optional[str] = Field(None, description="Document text/Markdown for action='pipeline'.")
-    targets: Optional[List[str]] = Field(None, description="Optional target adapter IDs for action='pipeline'.")
+    source: Optional[str] = Field("webhook", description="External source name for action='webhook_ingest' (e.g. 'paperless', 'nocodb', 'obsidian').")
+    doc_id: Optional[str] = Field("doc-preview", description="Document ID for action='pipeline'/'webhook_ingest'.")
+    title: Optional[str] = Field("", description="Document title for action='pipeline'/'webhook_ingest'.")
+    content: Optional[str] = Field(None, description="Document text/Markdown for action='pipeline'/'webhook_ingest'.")
+    targets: Optional[List[str]] = Field(None, description="Optional target adapter IDs for action='pipeline'/'webhook_ingest'.")
     dry_run: bool = Field(True, description="Defaults to True for safe preview. Pass dry_run=false + confirm=true to execute.")
     confirm: bool = Field(False, description="Required (true) when dry_run=false.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
@@ -1551,9 +1556,9 @@ class AdaptersIn(BaseModel):
 @_logged_tool
 async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
     """List, dry-run, or execute Option E Stage 3 native Python target adapters,
-    the 5-stage pipeline, and Stage 4 legacy n8n bridges.
-    'list'/'bridges' require 'read' scope; 'dispatch'/'pipeline'/'run_bridge'
-    require 'sync' scope and confirm=true when dry_run=false.
+    the 5-stage pipeline, DLQ inspection/replay, webhook ingest, and Stage 4 bridges.
+    'list'/'bridges'/'dlq' require 'read' scope; 'dispatch'/'pipeline'/'run_bridge'/
+    'replay_dlq'/'webhook_ingest' require 'sync' scope and confirm=true when dry_run=false.
     """
     act = params.action.strip().lower()
     if act == "list":
@@ -1572,6 +1577,15 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
             return f"Stage 4 bridges list failed: {text}"
         return out(text, data, params.output)
 
+    if act == "dlq":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_adapters dlq — needs 'read' (or '*')."
+        qs = f"?target_id={params.adapter_id}" if params.adapter_id else ""
+        ok, text, data = await core.dashboard_api(f"/api/stage3/dlq{qs}")
+        if not ok:
+            return f"Stage 3 DLQ lookup failed: {text}"
+        return out(text, data, params.output)
+
     if not _has_scope("sync"):
         return f"This token isn't scoped for udh_adapters '{act}' — needs 'sync' (or '*')."
 
@@ -1580,6 +1594,33 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
             f"Safety gate: live Stage 3/4 '{act}' (dry_run=false) requires confirm=true. "
             "Omit dry_run=false (defaults to dry_run=true) for a safe preview."
         )
+
+    if act == "replay_dlq":
+        ok, text, data = await core.dashboard_api(
+            "/api/stage3/dlq/replay",
+            method="POST",
+            json_body={"target_id": params.adapter_id, "dry_run": params.dry_run},
+        )
+        if not ok:
+            return f"Stage 3 DLQ replay failed: {text}"
+        return out(text, data, params.output)
+
+    if act == "webhook_ingest":
+        src = (params.source or "webhook").strip().lower()
+        ok, text, data = await core.dashboard_api(
+            f"/api/interop/webhook/{src}",
+            method="POST",
+            json_body={
+                "doc_id": params.doc_id,
+                "title": params.title,
+                "content": params.content or "",
+                "targets": params.targets,
+                "dry_run": params.dry_run,
+            },
+        )
+        if not ok:
+            return f"Interop webhook ingest failed: {text}"
+        return out(text, data, params.output)
 
     if act == "run_bridge":
         if not params.adapter_id:

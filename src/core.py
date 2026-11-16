@@ -43,10 +43,22 @@ WF16_AUTH_HEADER_NAME = os.environ.get("WF16_AUTH_HEADER_NAME", "X-UDH-Query-Tok
 UDH_DASHBOARD_URL = os.environ.get("UDH_DASHBOARD_URL", "https://udh-dashboard.nasmatrix.app").strip().rstrip("/")
 UDH_PREFER_NATIVE = os.environ.get("UDH_PREFER_NATIVE", "false").strip().lower() in ("1", "true", "yes")
 UDH_BACKEND_MODE = os.environ.get("UDH_BACKEND_MODE", "strangler").strip().lower()
+RUNTIME_MODE_OVERRIDE: Optional[str] = None
+
+
+def set_runtime_mode(mode: Optional[str]) -> None:
+    """Sync live backend routing mode override inside udh-mcp without restart."""
+    global RUNTIME_MODE_OVERRIDE
+    RUNTIME_MODE_OVERRIDE = mode.strip().lower() if isinstance(mode, str) and mode.strip() else None
 
 
 def _use_native_backend() -> bool:
     """True when udh-mcp should call udh-dashboard's native /api/native/* endpoints instead of n8n."""
+    if RUNTIME_MODE_OVERRIDE is not None:
+        if RUNTIME_MODE_OVERRIDE == "native":
+            return True
+        if RUNTIME_MODE_OVERRIDE == "n8n":
+            return False
     return UDH_BACKEND_MODE == "native" or UDH_PREFER_NATIVE
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -65,14 +77,25 @@ def _get_pooled_client() -> httpx.AsyncClient:
 
 async def _http_call(method: str, url: str, *, headers: Optional[dict] = None,
                      json_body: Optional[dict] = None, timeout: float = 30.0) -> httpx.Response:
-    """Execute an HTTP call using the shared connection pool unless mocked in tests."""
+    """Execute an HTTP call using the shared connection pool with bounded live transient retry."""
     if httpx.AsyncClient is not _REAL_ASYNC_CLIENT:
         async with httpx.AsyncClient(timeout=timeout) as h:
             if method.upper() == "GET":
                 return await h.get(url, headers=headers)
             return await getattr(h, method.lower())(url, headers=headers, json=json_body)
+    import asyncio
     client = _get_pooled_client()
-    return await client.request(method, url, headers=headers, json=json_body, timeout=timeout)
+    for attempt in range(2):
+        try:
+            resp = await client.request(method, url, headers=headers, json=json_body, timeout=timeout)
+            if resp.status_code in (429, 502, 503, 504) and attempt == 0:
+                await asyncio.sleep(0.1)
+                continue
+            return resp
+        except httpx.TransportError:
+            if attempt == 1:
+                raise
+            await asyncio.sleep(0.1)
 
 
 async def dashboard_api(path: str, method: str = "GET",
@@ -125,22 +148,23 @@ DESTRUCTIVE_ACTIONS = {"rollback", "confirm_delete", "resolve_conflict",
 UNGATED_ACTIONS = {"set_global_pause", "set_target_enabled"}
 
 
-async def dispatch(action: str, payload: Optional[dict] = None,
-                    timeout: float = 60.0) -> tuple:
-    """POST one action to native /api/native/dispatch (Option E) or WF-07 webhook."""
-    if _use_native_backend():
-        ok, text, data = await dashboard_api(
-            "/api/native/dispatch",
-            method="POST",
-            json_body={"action": action, **(payload or {})},
-            timeout=timeout,
-        )
-        if not ok:
-            return False, text, data
-        if isinstance(data, dict) and data.get("halted"):
-            return False, data.get("message") or f"Native gate halted action '{action}'", data
-        return True, f"Dispatched '{action}' (native): {json.dumps(data, default=str)[:500]}", data
+async def _dispatch_native(action: str, payload: Optional[dict], timeout: float) -> tuple:
+    ok, text, data = await dashboard_api(
+        "/api/native/dispatch",
+        method="POST",
+        json_body={"action": action, **(payload or {})},
+        timeout=timeout,
+    )
+    if not ok:
+        return False, text, data
+    if isinstance(data, dict) and data.get("halted"):
+        return False, data.get("message") or f"Native gate halted action '{action}'", data
+    if isinstance(data, dict):
+        data.setdefault("routed_via", "native")
+    return True, f"Dispatched '{action}' (native): {json.dumps(data, default=str)[:500]}", data
 
+
+async def _dispatch_n8n(action: str, payload: Optional[dict], timeout: float) -> tuple:
     if not WF07_URL or not WF07_AUTH_TOKEN:
         return False, "WF07_URL / WF07_AUTH_TOKEN not configured.", None
     body = {"action": action, **(payload or {})}
@@ -165,13 +189,40 @@ async def dispatch(action: str, payload: Optional[dict] = None,
 
     if isinstance(data, dict) and data.get("halted"):
         return False, data.get("message") or f"WF-07 halted action '{action}'", data
+    if isinstance(data, dict):
+        data.setdefault("routed_via", "n8n")
     return True, f"Dispatched '{action}': {json.dumps(data, default=str)[:500]}", data
 
 
-async def dashboard_data(timeout: float = 30.0) -> tuple:
-    """GET native /api/native/dashboard-data (Option E) or WF-14's webhook. Read-only."""
+async def dispatch(action: str, payload: Optional[dict] = None,
+                    timeout: float = 60.0) -> tuple:
+    """POST one action to native /api/native/dispatch or WF-07 webhook with automatic failover."""
     if _use_native_backend():
-        return await dashboard_api("/api/native/dashboard-data", method="GET", timeout=timeout)
+        ok, text, data = await _dispatch_native(action, payload, timeout)
+        if ok or (isinstance(data, dict) and data.get("halted")):
+            return ok, text, data
+        if WF07_URL and WF07_AUTH_TOKEN:
+            fb_ok, fb_text, fb_data = await _dispatch_n8n(action, payload, timeout)
+            if fb_ok and isinstance(fb_data, dict):
+                fb_data["routed_via"] = "n8n_fallback"
+                fb_text = f"Dispatched '{action}' (n8n_fallback): {json.dumps(fb_data, default=str)[:500]}"
+            return fb_ok, fb_text, fb_data
+        return ok, text, data
+
+    ok, text, data = await _dispatch_n8n(action, payload, timeout)
+    if ok or (isinstance(data, dict) and data.get("halted")) or not (WF07_URL and WF07_AUTH_TOKEN):
+        return ok, text, data
+    if UDH_DASHBOARD_URL:
+        fb_ok, fb_text, fb_data = await _dispatch_native(action, payload, timeout)
+        if fb_ok and isinstance(fb_data, dict):
+            fb_data["routed_via"] = "native_fallback"
+            fb_text = f"Dispatched '{action}' (native_fallback): {json.dumps(fb_data, default=str)[:500]}"
+        if fb_ok or (isinstance(fb_data, dict) and fb_data.get("halted")):
+            return fb_ok, fb_text, fb_data
+    return ok, text, data
+
+
+async def _dashboard_n8n(timeout: float) -> tuple:
     if not WF14_URL or not WF14_AUTH_TOKEN:
         return False, "WF14_URL / WF14_AUTH_TOKEN not configured.", None
     try:
@@ -186,7 +237,37 @@ async def dashboard_data(timeout: float = 30.0) -> tuple:
         data = r.json() if r.content else {}
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", None
+    if isinstance(data, dict):
+        data.setdefault("routed_via", "n8n")
     return True, json.dumps(data, indent=2, default=str), data
+
+
+async def dashboard_data(timeout: float = 30.0) -> tuple:
+    """GET native /api/native/dashboard-data or WF-14 webhook with automatic failover."""
+    if _use_native_backend():
+        ok, text, data = await dashboard_api("/api/native/dashboard-data", method="GET", timeout=timeout)
+        if ok:
+            if isinstance(data, dict):
+                data.setdefault("routed_via", "native")
+            return ok, json.dumps(data, indent=2, default=str), data
+        if WF14_URL and WF14_AUTH_TOKEN:
+            fb_ok, fb_text, fb_data = await _dashboard_n8n(timeout)
+            if fb_ok and isinstance(fb_data, dict):
+                fb_data["routed_via"] = "n8n_fallback"
+                fb_text = json.dumps(fb_data, indent=2, default=str)
+            return fb_ok, fb_text, fb_data
+        return ok, text, data
+
+    ok, text, data = await _dashboard_n8n(timeout)
+    if ok or not (WF14_URL and WF14_AUTH_TOKEN):
+        return ok, text, data
+    if UDH_DASHBOARD_URL:
+        fb_ok, fb_text, fb_data = await dashboard_api("/api/native/dashboard-data", method="GET", timeout=timeout)
+        if fb_ok and isinstance(fb_data, dict):
+            fb_data["routed_via"] = "native_fallback"
+            fb_text = json.dumps(fb_data, indent=2, default=str)
+            return True, fb_text, fb_data
+    return ok, text, data
 
 
 QUERY_KINDS = ["get_document", "search_documents", "list_conflicts",
@@ -194,26 +275,23 @@ QUERY_KINDS = ["get_document", "search_documents", "list_conflicts",
                "get_content"]
 
 
-async def query(kind: str, params: Optional[dict] = None,
-                 timeout: float = 30.0) -> tuple:
-    """POST a query to WF-16's query-api webhook. Returns (ok, text, data).
-    Read-only -- WF-16 (n8n-workflows/wf16_udh_query_api.json in
-    matrix-homelab) only ever runs Postgres SELECTs, never writes.
-    """
-    if kind not in QUERY_KINDS:
-        return False, f"Unknown query kind '{kind}'. Kinds: {', '.join(QUERY_KINDS)}", None
-    if _use_native_backend():
-        ok, text, data = await dashboard_api(
-            "/api/native/query",
-            method="POST",
-            json_body={"kind": kind, **(params or {})},
-            timeout=timeout,
-        )
-        if not ok:
-            return False, text, data
-        if isinstance(data, dict) and data.get("error"):
-            return False, str(data["error"]), data
-        return True, text, data
+async def _query_native(kind: str, params: Optional[dict], timeout: float) -> tuple:
+    ok, text, data = await dashboard_api(
+        "/api/native/query",
+        method="POST",
+        json_body={"kind": kind, **(params or {})},
+        timeout=timeout,
+    )
+    if not ok:
+        return False, text, data
+    if isinstance(data, dict) and data.get("error"):
+        return False, str(data["error"]), data
+    if isinstance(data, dict):
+        data.setdefault("routed_via", "native")
+    return True, json.dumps(data, indent=2, default=str), data
+
+
+async def _query_n8n(kind: str, params: Optional[dict], timeout: float) -> tuple:
     if not WF16_URL or not WF16_AUTH_TOKEN:
         return False, "WF16_URL / WF16_AUTH_TOKEN not configured.", None
     body = {"kind": kind, **(params or {})}
@@ -234,4 +312,36 @@ async def query(kind: str, params: Optional[dict] = None,
         return False, f"{type(e).__name__}: {e}", None
     if isinstance(data, dict) and data.get("error"):
         return False, str(data["error"]), data
+    if isinstance(data, dict):
+        data.setdefault("routed_via", "n8n")
     return True, json.dumps(data, indent=2, default=str), data
+
+
+async def query(kind: str, params: Optional[dict] = None,
+                 timeout: float = 30.0) -> tuple:
+    """POST a query to native /api/native/query or WF-16 with automatic failover."""
+    if kind not in QUERY_KINDS:
+        return False, f"Unknown query kind '{kind}'. Kinds: {', '.join(QUERY_KINDS)}", None
+
+    if _use_native_backend():
+        ok, text, data = await _query_native(kind, params, timeout)
+        if ok or (isinstance(data, dict) and data.get("error")):
+            return ok, text, data
+        if WF16_URL and WF16_AUTH_TOKEN:
+            fb_ok, fb_text, fb_data = await _query_n8n(kind, params, timeout)
+            if fb_ok and isinstance(fb_data, dict):
+                fb_data["routed_via"] = "n8n_fallback"
+                fb_text = json.dumps(fb_data, indent=2, default=str)
+            return fb_ok, fb_text, fb_data
+        return ok, text, data
+
+    ok, text, data = await _query_n8n(kind, params, timeout)
+    if ok or (isinstance(data, dict) and data.get("error")) or not (WF16_URL and WF16_AUTH_TOKEN):
+        return ok, text, data
+    if UDH_DASHBOARD_URL:
+        fb_ok, fb_text, fb_data = await _query_native(kind, params, timeout)
+        if fb_ok and isinstance(fb_data, dict):
+            fb_data["routed_via"] = "native_fallback"
+            fb_text = json.dumps(fb_data, indent=2, default=str)
+            return True, fb_text, fb_data
+    return ok, text, data

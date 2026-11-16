@@ -409,30 +409,35 @@ async def main() -> None:
 
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     
-    # udh_simulate
-    r = await server.udh_simulate(server.SimulateIn(scenario="et_witness_statement"), _FakeCtx())
-    check("udh_simulate executes dry-run simulation and returns 64-bit simhash", "0x" in r and "UDH Pipeline Simulation" in r)
+    _off_wf07u, _off_wf07t, _off_dash = core.WF07_URL, core.WF07_AUTH_TOKEN, core.UDH_DASHBOARD_URL
+    core.WF07_URL, core.WF07_AUTH_TOKEN, core.UDH_DASHBOARD_URL = "", "", ""
+    try:
+        # udh_simulate
+        r = await server.udh_simulate(server.SimulateIn(scenario="et_witness_statement"), _FakeCtx())
+        check("udh_simulate executes dry-run simulation and returns 64-bit simhash", "0x" in r and "UDH Pipeline Simulation" in r)
 
-    # udh_checkpoint
-    r = await server.udh_checkpoint(server.CheckpointIn(action="create", name="pre-batch-test"), _FakeCtx())
-    check("udh_checkpoint create succeeds with sync scope", "pre-batch-test" in r)
+        # udh_checkpoint
+        r = await server.udh_checkpoint(server.CheckpointIn(action="create", name="pre-batch-test"), _FakeCtx())
+        check("udh_checkpoint create succeeds with sync scope", "pre-batch-test" in r)
 
-    r = await server.udh_checkpoint(server.CheckpointIn(action="restore", checkpoint_id="cp-123", confirm=False), _FakeCtx())
-    check("udh_checkpoint restore confirm=false previews without mutating", "Would restore" in r)
+        r = await server.udh_checkpoint(server.CheckpointIn(action="restore", checkpoint_id="cp-123", confirm=False), _FakeCtx())
+        check("udh_checkpoint restore confirm=false previews without mutating", "Would restore" in r)
 
-    # udh_tokens
-    r = await server.udh_tokens(server.TokensIn(action="get_metrics"), _FakeCtx())
-    check("udh_tokens get_metrics returns token burn stats", "UDH Token Burn Status" in r)
+        # udh_tokens
+        r = await server.udh_tokens(server.TokensIn(action="get_metrics"), _FakeCtx())
+        check("udh_tokens get_metrics returns token burn stats", "UDH Token Burn Status" in r)
 
-    r = await server.udh_tokens(server.TokensIn(action="set_budget", daily_budget=200000), _FakeCtx())
-    check("udh_tokens set_budget updates daily cap", "200,000" in r)
+        r = await server.udh_tokens(server.TokensIn(action="set_budget", daily_budget=200000), _FakeCtx())
+        check("udh_tokens set_budget updates daily cap", "200,000" in r)
 
-    # udh_tags
-    r = await server.udh_tags(server.TagsIn(action="cluster_tags"), _FakeCtx())
-    check("udh_tags cluster_tags detects synonyms and clusters", "Discovered" in r)
+        # udh_tags
+        r = await server.udh_tags(server.TagsIn(action="cluster_tags"), _FakeCtx())
+        check("udh_tags cluster_tags detects synonyms and clusters", "Discovered" in r)
 
-    r = await server.udh_tags(server.TagsIn(action="consolidate_tags", canonical_tag="invoice", deprecated_tags=["invoices"], confirm=False), _FakeCtx())
-    check("udh_tags consolidate_tags confirm=false previews without writing", "Would consolidate" in r)
+        r = await server.udh_tags(server.TagsIn(action="consolidate_tags", canonical_tag="invoice", deprecated_tags=["invoices"], confirm=False), _FakeCtx())
+        check("udh_tags consolidate_tags confirm=false previews without writing", "Would consolidate" in r)
+    finally:
+        core.WF07_URL, core.WF07_AUTH_TOKEN, core.UDH_DASHBOARD_URL = _off_wf07u, _off_wf07t, _off_dash
 
     # udh_fleet
     r = await server.udh_fleet(server.FleetIn(action="get_status"), _FakeCtx())
@@ -648,6 +653,102 @@ async def main() -> None:
     finally:
         core.httpx = _oh_b
         core.UDH_DASHBOARD_URL = _old_b_dash
+
+    # Bidirectional automatic failover (n8n <-> native) & DLQ/webhook MCP actions
+    class _FailoverHTTP:
+        def __init__(self):
+            self.calls = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            self.calls.append(("GET", url))
+            if "n8n.test" in url:
+                return _Resp(502, {"error": "bad gateway"})
+            return _Resp(200, {"hub_config": {"global_pause": False}, "ok": True})
+
+        async def post(self, url, headers=None, json=None):
+            self.calls.append(("POST", url, json))
+            if "udh-dashboard.test" in url:
+                return _Resp(503, {"error": "native busy"})
+            return _Resp(200, {"status": "ok", "from": "n8n"})
+
+    fail_http = _FailoverHTTP()
+
+    class _ShimFO:
+        AsyncClient = staticmethod(lambda *a, **k: fail_http)
+
+    _oh_fo = core.httpx
+    _old_fo_mode = core.UDH_BACKEND_MODE
+    _old_fo_pref = core.UDH_PREFER_NATIVE
+    _old_fo_override = core.RUNTIME_MODE_OVERRIDE
+    _old_fo_dash = core.UDH_DASHBOARD_URL
+    _old_fo_wf14 = core.WF14_URL
+    _old_fo_wf14t = core.WF14_AUTH_TOKEN
+    _old_fo_wf07 = core.WF07_URL
+    _old_fo_wf07t = core.WF07_AUTH_TOKEN
+    core.httpx = _ShimFO
+    core.UDH_DASHBOARD_URL = "https://udh-dashboard.test"
+    core.WF14_URL = "https://n8n.test/webhook/dashboard"
+    core.WF14_AUTH_TOKEN = "t14"
+    core.WF07_URL = "https://n8n.test/webhook/dispatch"
+    core.WF07_AUTH_TOKEN = "t07"
+    try:
+        core.set_runtime_mode("n8n")
+        ok_dash, _, dash_data = await core.dashboard_data()
+        check("Bidirectional failover: n8n 502 auto-falls back to native dashboard",
+              ok_dash and isinstance(dash_data, dict) and dash_data.get("routed_via") == "native_fallback")
+
+        core.set_runtime_mode("native")
+        ok_disp, _, disp_data = await core.dispatch("check_health", {})
+        check("Bidirectional failover: native 503 auto-falls back to n8n WF-07",
+              ok_disp and isinstance(disp_data, dict) and disp_data.get("routed_via") == "n8n_fallback")
+
+        core.set_runtime_mode(None)
+        sync_dlq = ctx_with_scopes("sync")
+        try:
+            fake_dlq = _FakeHTTP()
+            fake_dlq.get_resp = _Resp(200, {"ok": True, "count": 1, "items": [{"id": "dlq-1"}]})
+            fake_dlq.post_resp = _Resp(200, {"ok": True, "replayed": 1, "succeeded": 1})
+
+            class _ShimDLQ:
+                AsyncClient = staticmethod(lambda *a, **k: fake_dlq)
+
+            core.httpx = _ShimDLQ
+            read_dlq = ctx_with_scopes("read")
+            try:
+                r = await server.udh_adapters(server.AdaptersIn(action="dlq", adapter_id="docmost"), _FakeCtx())
+                check("udh_adapters action=dlq queries /api/stage3/dlq",
+                      fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/stage3/dlq?target_id=docmost")
+            finally:
+                auth_context_var.reset(read_dlq)
+
+            r = await server.udh_adapters(server.AdaptersIn(action="replay_dlq", dry_run=False, confirm=True), _FakeCtx())
+            check("udh_adapters action=replay_dlq posts to /api/stage3/dlq/replay",
+                  fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/stage3/dlq/replay")
+
+            r = await server.udh_adapters(
+                server.AdaptersIn(action="webhook_ingest", source="paperless", doc_id="pl-1", content="hi", dry_run=True),
+                _FakeCtx(),
+            )
+            check("udh_adapters action=webhook_ingest posts to /api/interop/webhook/paperless",
+                  fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/interop/webhook/paperless")
+        finally:
+            auth_context_var.reset(sync_dlq)
+    finally:
+        core.httpx = _oh_fo
+        core.UDH_BACKEND_MODE = _old_fo_mode
+        core.UDH_PREFER_NATIVE = _old_fo_pref
+        core.RUNTIME_MODE_OVERRIDE = _old_fo_override
+        core.UDH_DASHBOARD_URL = _old_fo_dash
+        core.WF14_URL = _old_fo_wf14
+        core.WF14_AUTH_TOKEN = _old_fo_wf14t
+        core.WF07_URL = _old_fo_wf07
+        core.WF07_AUTH_TOKEN = _old_fo_wf07t
 
     print(f"\n{'ALL PASS' if not failed else 'FAILURES: ' + ', '.join(failed)}")
     if failed:
