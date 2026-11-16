@@ -830,11 +830,12 @@ async def udh_simulate(params: SimulateIn, ctx: Context) -> str:
         "compensation_triggered": bool(params.fault and params.fault != "none"),
     }
     
+    target_pairs = ", ".join(f"{k}:{v['status']}" for k, v in target_results.items())
     text = (
         f"UDH Pipeline Simulation: {sim_data['execution_id']}\n"
         f"• SimHash 64-bit: {simhash_hex}\n"
         f"• Word Count:     {word_count} ({est_tokens} tokens, ${sim_data['metrics']['estimated_cost_usd']})\n"
-        f"• Targets:        {', '.join(f'{k}:{v["status"]}' for k, v in target_results.items())}\n"
+        f"• Targets:        {target_pairs}\n"
         f"• Result:         {'SUCCESS' if sim_data['all_succeeded'] else 'COMPENSATED'}"
     )
     return out(text, sim_data, params.output)
