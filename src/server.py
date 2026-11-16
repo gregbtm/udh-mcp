@@ -1539,8 +1539,8 @@ async def udh_scheduler(params: SchedulerIn, ctx: Context) -> str:
 
 class AdaptersIn(BaseModel):
     model_config = M
-    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline' | 'bridges' | 'run_bridge' | 'dlq' | 'replay_dlq' | 'webhook_ingest'.")
-    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch'/'dlq'/'replay_dlq' (e.g. 'trilium', 'paperless') or bridge ID for action='run_bridge'.")
+    action: str = Field("list", description="'list' | 'dispatch' | 'pipeline' | 'extract_native' | 'index_native' | 'bridges' | 'run_bridge' | 'dlq' | 'replay_dlq' | 'webhook_ingest'.")
+    adapter_id: Optional[str] = Field(None, description="Adapter ID for action='dispatch'/'dlq'/'replay_dlq' (e.g. 'trilium', 'paperless', 'stirlingpdf', 'apprise', 'gotify', 'changedetection', 'freshrss', 'karakeep', 'owncloud', 'immich', 'mailarchiver', 'librechat') or bridge ID for action='run_bridge'.")
     direction: str = Field("out", description="'in' or 'out' for action='dispatch'.")
     source: Optional[str] = Field("webhook", description="External source name for action='webhook_ingest' (e.g. 'paperless', 'nocodb', 'obsidian').")
     doc_id: Optional[str] = Field("doc-preview", description="Document ID for action='pipeline'/'webhook_ingest'.")
@@ -1586,6 +1586,18 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
             return f"Stage 3 DLQ lookup failed: {text}"
         return out(text, data, params.output)
 
+    if act == "extract_native":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_adapters extract_native — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api(
+            "/api/native/extract",
+            method="POST",
+            json_body={"filename": params.title or "document.md", "content": params.content or ""},
+        )
+        if not ok:
+            return f"Native extraction failed: {text}"
+        return out(text, data, params.output)
+
     if not _has_scope("sync"):
         return f"This token isn't scoped for udh_adapters '{act}' — needs 'sync' (or '*')."
 
@@ -1594,6 +1606,23 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
             f"Safety gate: live Stage 3/4 '{act}' (dry_run=false) requires confirm=true. "
             "Omit dry_run=false (defaults to dry_run=true) for a safe preview."
         )
+
+    if act == "index_native":
+        if not params.content:
+            return "content is required for action='index_native'."
+        ok, text, data = await core.dashboard_api(
+            "/api/native/index",
+            method="POST",
+            json_body={
+                "doc_id": params.doc_id or "doc-preview",
+                "title": params.title or "Untitled",
+                "content": params.content,
+                "dry_run": params.dry_run,
+            },
+        )
+        if not ok:
+            return f"Native vector indexing failed: {text}"
+        return out(text, data, params.output)
 
     if act == "replay_dlq":
         ok, text, data = await core.dashboard_api(

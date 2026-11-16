@@ -102,8 +102,13 @@ async def dashboard_api(path: str, method: str = "GET",
                         json_body: Optional[dict] = None, timeout: float = 15.0) -> tuple:
     """Call UDH Dashboard REST API (/api/dictionary, /api/errors, /api/version, /api/updates)."""
     url = f"{UDH_DASHBOARD_URL}{path}"
+    headers = {"Accept": "application/json"}
+    api_token = os.environ.get("UDH_API_TOKEN", "").strip()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+        headers["X-UDH-API-Token"] = api_token
     try:
-        r = await _http_call(method, url, headers={"Accept": "application/json"},
+        r = await _http_call(method, url, headers=headers,
                              json_body=json_body, timeout=timeout)
         if r.status_code != 200:
             return False, f"HTTP {r.status_code}: {r.text[:300]}", None

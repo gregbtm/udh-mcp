@@ -737,6 +737,33 @@ async def main() -> None:
             )
             check("udh_adapters action=webhook_ingest posts to /api/interop/webhook/paperless",
                   fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/interop/webhook/paperless")
+
+            old_api_tok = os.environ.get("UDH_API_TOKEN")
+            os.environ["UDH_API_TOKEN"] = "mcp-api-secret"
+            try:
+                r = await server.udh_adapters(
+                    server.AdaptersIn(action="index_native", doc_id="idx-1", title="Idx", content="Vector body", dry_run=True),
+                    _FakeCtx(),
+                )
+                check("udh_adapters action=index_native forwards UDH_API_TOKEN Bearer header",
+                      fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/index"
+                      and fake_dlq.calls["posts"][-1][1].get("Authorization") == "Bearer mcp-api-secret")
+            finally:
+                if old_api_tok is None:
+                    os.environ.pop("UDH_API_TOKEN", None)
+                else:
+                    os.environ["UDH_API_TOKEN"] = old_api_tok
+
+            read_ext = ctx_with_scopes("read")
+            try:
+                r = await server.udh_adapters(
+                    server.AdaptersIn(action="extract_native", title="note.md", content="Claim [2026] UKEAT 7"),
+                    _FakeCtx(),
+                )
+                check("udh_adapters action=extract_native posts to /api/native/extract",
+                      fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/extract")
+            finally:
+                auth_context_var.reset(read_ext)
         finally:
             auth_context_var.reset(sync_dlq)
     finally:
