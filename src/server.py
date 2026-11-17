@@ -1431,7 +1431,7 @@ class SetupIn(BaseModel):
     model_config = M
     action: str = Field(
         "status",
-        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (22-tool cheat sheet) | 'parity' (WF-14 vs Postgres diff) | 'cutover_check' (Stage 4 readiness) | 'bootstrap_pg' (1-click Postgres schema & n8n seeder).",
+        description="'status' (env & live backend check) | 'connect_guide' (client JSON & curl) | 'quickstart' (22-tool cheat sheet) | 'parity' (WF-14 vs Postgres diff) | 'cutover_check' (Stage 4 readiness & full-site wiring report) | 'wiring_check' (16-route & health self-check) | 'bootstrap_pg' (1-click Postgres schema & n8n seeder).",
     )
     dry_run: bool = Field(True, description="Used by action='bootstrap_pg' (defaults to True for safe preview).")
     confirm: bool = Field(False, description="Required (true) for action='bootstrap_pg' with dry_run=false.")
@@ -1475,9 +1475,15 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
         return out(text, data, params.output)
 
     if act == "cutover_check":
-        ok, text, data = await core.dashboard_api("/api/stage4/cutover-check")
+        ok, text, data = await core.dashboard_api("/api/migration/readiness-report")
         if not ok:
             return f"Stage 4 cutover check failed: {text}"
+        return out(text, data, params.output)
+
+    if act == "wiring_check":
+        ok, text, data = await core.dashboard_api("/api/self-check/wiring")
+        if not ok:
+            return f"Site wiring self-check failed: {text}"
         return out(text, data, params.output)
     if act == "connect_guide":
         guide = {

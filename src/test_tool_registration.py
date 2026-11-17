@@ -769,6 +769,14 @@ async def main() -> None:
                 )
                 check("udh_dictionary resource=context_language queries /api/context-language/catalog",
                       fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/context-language/catalog?q=mojibake")
+
+                await server.udh_setup(server.SetupIn(action="cutover_check"), _FakeCtx())
+                check("udh_setup action=cutover_check queries /api/migration/readiness-report",
+                      fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/migration/readiness-report")
+
+                await server.udh_setup(server.SetupIn(action="wiring_check"), _FakeCtx())
+                check("udh_setup action=wiring_check queries /api/self-check/wiring",
+                      fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/self-check/wiring")
             finally:
                 auth_context_var.reset(read_ext)
 
