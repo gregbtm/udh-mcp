@@ -1152,24 +1152,107 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
 
 class ExtractInput(BaseModel):
     model_config = M
-    text: str = Field(..., min_length=1, description="Document text or Markdown to extract metadata from.")
+    text: str = Field(..., min_length=1, description="Document text or Markdown to extract metadata from or prepare as sanitized LLM context.")
+    action: str = Field(
+        "extract",
+        description="'extract' (zero-token legal/entity extraction & SimHash) | 'context_prepare' (mojibake repair, injection neutralization, readability & hierarchical chunk packing).",
+        pattern=r"^(extract|context_prepare)$",
+    )
+    target_register: str = Field(
+        "preserve",
+        description="Target language register for action='context_prepare': 'preserve' | 'plain_english' | 'legal_forensic'.",
+        pattern=r"^(preserve|plain_english|legal_forensic)$",
+    )
+    token_budget: int = Field(1200, ge=100, le=16000, description="Target prompt token budget for action='context_prepare'.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
 @server.tool(
     name="udh_extract",
-    title="UDH Zero-Token Extract",
+    title="UDH Zero-Token Extract & Context Prep",
     description=(
-        "Zero-token deterministic extraction: extracts UK neutral citations, statutes, GBP currency, "
-        "emails, dates, headings, word count, and 64-bit SimHash fingerprint with 0 LLM token burn."
+        "Zero-token deterministic extraction & context preparation: action='extract' extracts UK neutral citations, "
+        "statutes, GBP currency, emails, dates, headings, and 64-bit SimHash; action='context_prepare' repairs mojibake, "
+        "neutralizes prompt injections, scores readability, and packs heading-breadcrumb Markdown chunks within token_budget."
     ),
     annotations=RD,
 )
 async def udh_extract(params: ExtractInput) -> str:
     import hashlib
+    import math
     import re
 
     src = params.text
+    if params.action == "context_prepare":
+        repaired = src
+        mojibake_hits = 0
+        for bad, good in (
+            ("\u00e2\u20ac\u201d", "\u2014"),
+            ("\u00e2\u20ac\u201c", "\u2013"),
+            ("\u00e2\u20ac\u2122", "'"),
+            ("\u00c2\u00a3", "\u00a3"),
+        ):
+            if bad in repaired:
+                mojibake_hits += repaired.count(bad)
+                repaired = repaired.replace(bad, good)
+
+        repaired = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", repaired)
+        inj_hits = 0
+        for inj_pat in (
+            r"<\|(?:im_start|im_end|system|user|assistant|endoftext)\|>",
+            r"\[/?(?:INST|SYS)\]",
+            r"(?i)\bignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions\b",
+        ):
+            repaired, n = re.subn(inj_pat, "[NEUTRALIZED_DELIMITER]", repaired)
+            inj_hits += n
+
+        if params.target_register == "plain_english":
+            repaired = re.sub(r"\bwithout prejudice\b", "off-the-record settlement discussion", repaired, flags=re.IGNORECASE)
+            repaired = re.sub(r"\blegal professional privilege\b", "confidential lawyer-client advice", repaired, flags=re.IGNORECASE)
+        elif params.target_register == "legal_forensic":
+            repaired = re.sub(r"\borganization\b", "organisation", repaired)
+            repaired = re.sub(r"\banalyze\b", "analyse", repaired)
+
+        words = re.findall(r"[A-Za-z0-9']+", repaired)
+        sents = max(1, len([s for s in re.split(r"[.!?\n]+", repaired) if s.strip()]))
+        asl = round(len(words) / sents, 1)
+        chunks: list[dict[str, object]] = []
+        heading_ctx = "Document Root"
+        for para in [p.strip() for p in re.split(r"\n{2,}", repaired) if p.strip()]:
+            hm = re.match(r"^#{1,6}\s+(.+)", para)
+            if hm:
+                heading_ctx = hm.group(1).strip()
+            tok = max(1, math.ceil(len(para) / 4.0))
+            chunks.append({"breadcrumb": heading_ctx, "tokens": tok, "text": f"[Context: {heading_ctx}]\n{para}"})
+
+        packed: list[dict[str, object]] = []
+        used_tokens = 0
+        for ch in chunks:
+            t = int(ch["tokens"])  # type: ignore[arg-type]
+            if used_tokens + t <= params.token_budget or not packed:
+                packed.append(ch)
+                used_tokens += t
+
+        data = {
+            "action": "context_prepare",
+            "register": params.target_register,
+            "mojibake_repaired": mojibake_hits,
+            "injections_neutralized": inj_hits,
+            "word_count": len(words),
+            "avg_sentence_length": asl,
+            "chunk_count": len(chunks),
+            "selected_chunks": len(packed),
+            "tokens_used": used_tokens,
+            "token_budget": params.token_budget,
+            "prepared_text": "\n\n---\n\n".join(str(c["text"]) for c in packed),
+            "tokens_burned": 0,
+        }
+        text = (
+            f"Context Prepare ({len(packed)}/{len(chunks)} chunks, {used_tokens}/{params.token_budget} tokens, avg sentence {asl}w)\n"
+            f"• Mojibake fixed: {mojibake_hits} | Injections neutralized: {inj_hits} | Register: {params.target_register}\n\n"
+            f"{data['prepared_text']}"
+        )
+        return out(text, data, params.output)
     words = re.findall(r"\S+", src)
     headings = re.findall(r"^#{1,6}\s+(.+)$", src, flags=re.MULTILINE)
     case_refs = sorted(set(re.findall(r"\[\d{4}\]\s+(?:EWCA\s+Civ|UKEAT|UKSC|EWHC|ICR|IRLR)\s+[\w\d]+", src)))
@@ -1271,17 +1354,18 @@ async def udh_bundle_seal(params: BundleSealInput) -> str:
 
 class DictionaryIn(BaseModel):
     model_config = M
-    resource: str = Field("dictionary", description="'dictionary' | 'errors' | 'error_code'.")
-    domain: Optional[str] = Field(None, description="Optional domain filter (core_tables, target_adapters, frontmatter, apis, mcp).")
+    resource: str = Field("dictionary", description="'dictionary' | 'errors' | 'error_code' | 'context_language' (50-point Context & Language catalog).")
+    domain: Optional[str] = Field(None, description="Optional domain filter (core_tables, target_adapters, frontmatter, apis, mcp) or context pillar filter.")
     query: Optional[str] = Field(None, description="Optional search query or UDH-XXX error code.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
-@server.tool(name="udh_dictionary", title="UDH Data Dictionary & Error Catalog", annotations=RD)
+@server.tool(name="udh_dictionary", title="UDH Data Dictionary, Error & Context Catalog", annotations=RD)
 @_logged_tool
 async def udh_dictionary(params: DictionaryIn, ctx: Context) -> str:
-    """Query UDH Dashboard's Data Dictionary (/api/dictionary) and 100-item
-    Error & Fallback Catalog (/api/errors/catalog or /api/errors/{code}).
+    """Query UDH Dashboard's Data Dictionary (/api/dictionary), 100-item
+    Error & Fallback Catalog (/api/errors/catalog or /api/errors/{code}),
+    or 50-point Context & Language catalog (/api/context-language/catalog).
     Read-only — requires 'read' scope.
     """
     if not _has_scope("read"):
@@ -1296,6 +1380,10 @@ async def udh_dictionary(params: DictionaryIn, ctx: Context) -> str:
         ok, text, data = await core.dashboard_api(f"/api/errors/{code}")
     elif res == "errors":
         ok, text, data = await core.dashboard_api("/api/errors/catalog")
+    elif res == "context_language":
+        qs = urlencode({k: v for k, v in (("category", params.domain), ("q", params.query)) if v})
+        path = f"/api/context-language/catalog?{qs}" if qs else "/api/context-language/catalog"
+        ok, text, data = await core.dashboard_api(path)
     else:
         qs = urlencode({k: v for k, v in (("domain", params.domain), ("q", params.query)) if v})
         path = f"/api/dictionary?{qs}" if qs else "/api/dictionary"
