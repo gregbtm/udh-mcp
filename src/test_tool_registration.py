@@ -777,6 +777,19 @@ async def main() -> None:
                 await server.udh_setup(server.SetupIn(action="wiring_check"), _FakeCtx())
                 check("udh_setup action=wiring_check queries /api/self-check/wiring",
                       fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/self-check/wiring")
+
+                await server.udh_health(server.HealthIn(action="wiring_check"), _FakeCtx())
+                check("udh_health action=wiring_check queries /api/self-check/wiring",
+                      fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/self-check/wiring")
+
+                r_mcpf = await server.udh_dictionary(
+                    server.DictionaryIn(resource="mcp_features", query="SimHash", output="json"),
+                    _FakeCtx(),
+                )
+                import json as _j50
+                p50 = _j50.loads(r_mcpf)
+                check("udh_dictionary resource=mcp_features returns 50-feature catalog",
+                      p50.get("total") == 50 and p50.get("implemented") == 50 and p50.get("count", 0) >= 1)
             finally:
                 auth_context_var.reset(read_ext)
 
@@ -797,6 +810,39 @@ async def main() -> None:
                 and ctx_payload.get("injections_neutralized", 0) >= 1
                 and "off-the-record settlement discussion" in ctx_payload.get("prepared_text", ""),
             )
+
+            r_red = await server.udh_extract(
+                server.ExtractInput(
+                    text="NHS 485 291 0048, email j.doe@example.org, postcode CM1 1GU",
+                    action="redact_preview",
+                    output="json",
+                )
+            )
+            red_p = _json_ctx.loads(r_red)
+            check("udh_extract action=redact_preview masks UK NHS/email/postcode PII",
+                  red_p.get("total_redactions", 0) >= 3 and "j.doe@example.org" not in red_p.get("text", ""))
+
+            r_rb = await server.udh_extract(
+                server.ExtractInput(text="The organisation will analyse the tribunal order.", action="readability", output="json")
+            )
+            rb_p = _json_ctx.loads(r_rb)
+            check("udh_extract action=readability detects dialect and scores Flesch ease",
+                  rb_p.get("dialect") == "en-GB" and rb_p.get("words") == 7)
+
+            r_cs = await server.udh_extract(
+                server.ExtractInput(text="Offer £5,000 on 2026-01-01 vs £12,000 on 2026-02-02", action="conflict_scan", output="json")
+            )
+            check("udh_extract action=conflict_scan flags divergent GBP figures",
+                  _json_ctx.loads(r_cs).get("has_conflicts") is True)
+
+            import mcp_enhancements as enh
+            check("mcp_enhancements sanitize_secrets scrubs Bearer token",
+                  "Bearer [REDACTED]" in enh.sanitize_secrets("Authorization: Bearer supersecret123456"))
+            check("mcp_enhancements map_http_status_to_udh_error classifies 429 cleanly",
+                  enh.map_http_status_to_udh_error(429)["error_code"] == "UDH-018")
+            check("udh_tokens set_budget posts token_daily_budget to /api/settings/runtime",
+                  "Persisted" in await server.udh_tokens(server.TokensIn(action="set_budget", daily_budget=250000), _FakeCtx())
+                  and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/settings/runtime")
         finally:
             auth_context_var.reset(sync_dlq)
     finally:

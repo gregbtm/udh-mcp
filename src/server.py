@@ -88,6 +88,7 @@ from core import (
     DESTRUCTIVE_ACTIONS, DISPATCH_ACTIONS, QUERY_KINDS, UNGATED_ACTIONS,
     dashboard_data, dispatch, query,
 )
+import mcp_enhancements as enh
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -179,6 +180,7 @@ server = _build_server()
 # mutates state; this is just a liveness/debugging aid for /status).
 
 _TOOL_CALL_STATS: dict[str, dict[str, float]] = {}
+_TOOL_AUDIT_RING: list[dict[str, Any]] = []
 
 
 def _record_tool_call(tool_name: str, duration_ms: float, raised: bool) -> None:
@@ -186,7 +188,15 @@ def _record_tool_call(tool_name: str, duration_ms: float, raised: bool) -> None:
     s["count"] += 1
     if raised:
         s["errors"] += 1
-    s["total_ms"] += duration_ms
+    s["total_ms"] = round(s["total_ms"] + duration_ms, 2)
+    _TOOL_AUDIT_RING.insert(0, {
+        "tool": tool_name,
+        "duration_ms": round(duration_ms, 2),
+        "error": raised,
+        "ts": time.time(),
+    })
+    if len(_TOOL_AUDIT_RING) > 25:
+        del _TOOL_AUDIT_RING[25:]
 
 
 def _logged_tool(fn):
@@ -203,13 +213,14 @@ def _logged_tool(fn):
     return wrapper
 
 
-def out(text: str, data: Any, fmt: str) -> str:
+def out(text: str, data: Any, fmt: str, max_chars: int = 16000) -> str:
     import json as _json
-    return _json.dumps(data, indent=2, default=str) if fmt == "json" else text
+    raw = _json.dumps(data, indent=2, default=str) if fmt == "json" else text
+    return enh.sanitize_secrets(enh.smart_truncate(raw, limit=max_chars))
 
 
-def preview(action: str, resource: Any = None, **extra: Any) -> dict:
-    return {"preview": True, "action": action, "resource": resource, **extra}
+def preview(action: str, resource: Any = None, scope: str = "sync", **extra: Any) -> dict:
+    return {"preview": True, "action": action, "resource": resource, "scope_required": scope, "confirm_required": True, **extra}
 
 
 M = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -218,17 +229,32 @@ DE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=Fa
 RD = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True)
 
 
+@server.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "ok": True,
+        "service": "udh-mcp",
+        "version": os.getenv("UDH_MCP_VERSION", "2.7.0"),
+        "tools": 22,
+        "mcp_features": enh.get_mcp_feature_summary(),
+    })
+
+
 @server.custom_route("/status", methods=["GET"])
 async def status(request: Request) -> JSONResponse:
     if AUTH_TOKEN and not _authorised(request):
         return JSONResponse({"status": "ok"})
     return JSONResponse({
         "status": "ok",
+        "version": os.getenv("UDH_MCP_VERSION", "2.7.0"),
         "auth_required": bool(AUTH_TOKEN),
         "wf07_configured": bool(core.WF07_URL and core.WF07_AUTH_TOKEN),
         "wf14_configured": bool(core.WF14_URL and core.WF14_AUTH_TOKEN),
         "wf16_configured": bool(core.WF16_URL and core.WF16_AUTH_TOKEN),
+        "mcp_features": enh.get_mcp_feature_summary(),
+        "transport_stats": core.get_transport_stats(),
         "tool_call_stats": _TOOL_CALL_STATS,
+        "recent_audit": _TOOL_AUDIT_RING[:10],
     })
 
 
@@ -242,18 +268,28 @@ class DashboardIn(BaseModel):
 @server.tool(name="udh_dashboard", title="UDH Dashboard Snapshot", annotations=RD)
 @_logged_tool
 async def udh_dashboard(params: DashboardIn, ctx: Context) -> str:
-    """Read-only system snapshot of the Universal Document Hub, via WF-14:
-    hub_config (global_pause, dry_run, batch limits, ...), target_config
-    (every connected system's sync_direction/enabled flags/conflict
-    settings), recent operation_log entries, and the current conflict_queue.
-    No confirm needed — nothing here writes.
-
-    Requires WF14_URL/WF14_AUTH_TOKEN in the environment.
+    """Read-only system snapshot of the Universal Document Hub (native Postgres or WF-14),
+    surfacing degraded fallback warnings, global pause, conflicts, and quarantine alerts upfront.
+    Requires 'read' scope.
     """
     if not _has_scope("read"):
         return "This token isn't scoped for udh_dashboard — needs 'read' (or '*')."
     ok, text, data = await dashboard_data()
-    return out(text, data, params.output) if ok else text
+    if not ok:
+        return text
+    if params.output == "text" and isinstance(data, dict):
+        alerts = []
+        if data.get("is_mock") or data.get("fallback_tier"):
+            alerts.append(f"fallback_tier={data.get('fallback_tier') or 'mock'}")
+        hc = data.get("hub_config") or {}
+        if hc.get("global_pause"):
+            alerts.append("GLOBAL_PAUSE=ACTIVE")
+        cq = (data.get("conflict_queue") or {}).get("open_count", 0)
+        if cq:
+            alerts.append(f"open_conflicts={cq}")
+        if alerts:
+            text = f"[Alerts: {', '.join(alerts)}]\n{text}"
+    return out(text, data, params.output)
 
 
 # ================================================================== udh_query
@@ -275,6 +311,7 @@ class QueryIn(BaseModel):
     document_type: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
     sensitivity: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
     folder: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
+    sanitize_pii: bool = Field(False, description="get_content/search_fulltext: when true, deterministically scrubs NHS/NINO/email/phone/postcode PII before returning text.")
 
 
 @server.tool(name="udh_query", title="UDH Document & Conflict Query", annotations=RD)
@@ -329,6 +366,12 @@ async def udh_query(params: QueryIn, ctx: Context) -> str:
         "folder": params.folder,
     }.items() if v is not None}
     ok, text, data = await query(params.kind, qparams)
+    if ok and params.sanitize_pii and isinstance(data, dict):
+        if isinstance(data.get("content"), str):
+            red = enh.redact_sensitive_pii(data["content"])
+            data = {**data, "content": red["text"], "pii_redactions": red["total_redactions"]}
+            import json as _jq
+            text = _jq.dumps(data, indent=2, default=str)
     return out(text, data, params.output) if ok else text
 
 
@@ -338,7 +381,7 @@ class SyncIn(BaseModel):
     model_config = M
     action: str = Field(..., description=(
         "publish | ingest | reenrich | scan_drift | scrape_url | snapshot | "
-        "sync_outbound | backfill_trilium"))
+        "sync_outbound | backfill_trilium | propagate_paperless | reindex_vectors"))
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required for every action here.")
     payload: Optional[dict] = Field(None, description=(
@@ -350,7 +393,8 @@ class SyncIn(BaseModel):
 
 
 _SYNC_ACTIONS = {"publish", "ingest", "reenrich", "scan_drift", "scrape_url",
-                  "snapshot", "sync_outbound", "backfill_trilium"}
+                  "snapshot", "sync_outbound", "backfill_trilium",
+                  "propagate_paperless", "reindex_vectors"}
 
 
 @server.tool(name="udh_sync", title="UDH Sync Operations", annotations=WR)
@@ -525,42 +569,29 @@ async def udh_control(params: ControlIn, ctx: Context) -> str:
 
 class HealthIn(BaseModel):
     model_config = M
-    action: str = Field(..., description="check_health | check_integrity")
+    action: str = Field(..., description="check_health | check_integrity | wiring_check")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required.")
     target_id: Optional[str] = Field(None, description="check_health: scope to one target_config row (e.g. 'trilium'). Accepted but NOT YET filtered server-side as of 2026-10-13 -- every target is checked regardless.")
     case_folder: Optional[str] = Field(None, description="check_integrity: scope to one case folder. Accepted but NOT YET filtered server-side as of 2026-10-13 -- the whole registry is checked regardless.")
 
 
-_HEALTH_ACTIONS = {"check_health", "check_integrity"}
+_HEALTH_ACTIONS = {"check_health", "check_integrity", "wiring_check"}
 
 
 @server.tool(name="udh_health", title="UDH Health & Integrity Checks", annotations=WR)
 @_logged_tool
 async def udh_health(params: HealthIn, ctx: Context) -> str:
-    """Trigger an on-demand adapter health check (WF-08) or canonical
-    integrity check (WF-11), via WF-07, instead of waiting for their
-    normal cron schedule. Added 2026-10-12 server-side in matrix-homelab
-    specifically to close the gap this server's own ROADMAP.md named as
-    A1/A2: before this, there was no way to ask "is the Notion adapter
-    actually working right now" or "did this week's integrity check
-    already run, and what did it find" without digging into n8n directly.
-
-    check_health: per-target round-trip test (auth still valid, API still
-    responds) -- catches an adapter silently broken before real documents
-    fail against it. target_id is accepted but every target is checked
-    regardless as of 2026-10-13 (not yet filtered server-side).
-
-    check_integrity: SHA-256 verification of every canonical file plus
-    orphaned-target-ID detection. case_folder is accepted but the whole
-    registry is checked regardless as of 2026-10-13 (same caveat).
-
-    Both trigger a real workflow run (not free) — confirm=true is
-    required, same as udh_sync, but only 'sync' scope, since neither
-    restores, overwrites, or destroys anything.
+    """Trigger an on-demand adapter health check (WF-08), canonical
+    integrity check (WF-11), or read-only site-wide wiring self-check ('wiring_check').
     """
     if params.action not in _HEALTH_ACTIONS:
         return f"Unknown action '{params.action}'. Actions: {', '.join(sorted(_HEALTH_ACTIONS))}"
+    if params.action == "wiring_check":
+        if not _has_scope("read"):
+            return "This token isn't scoped for udh_health action='wiring_check' — needs 'read' (or '*')."
+        ok, text, data = await core.dashboard_api("/api/self-check/wiring")
+        return out(text, data, params.output) if ok else f"Site wiring self-check failed: {text}"
     if not _has_scope("sync"):
         return f"This token isn't scoped for udh_health action='{params.action}' — needs 'sync' (or '*')."
     payload: dict = {}
@@ -634,7 +665,7 @@ async def udh_config(params: ConfigIn, ctx: Context) -> str:
             return f"This token isn't scoped for udh_config action='{params.action}' — needs 'read' (or '*')."
         ok, text, data = await core.dashboard_api("/api/settings/runtime")
         if ok:
-            return out(text, data, params.output)
+            return out(enh.sanitize_secrets(text), data, params.output)
         import json
         fallback = {
             "offline_fallback": True,
@@ -790,17 +821,7 @@ async def udh_simulate(params: SimulateIn, ctx: Context) -> str:
     )
     words = raw_text.split()
     word_count = len(words)
-    
-    v = [0] * 64
-    for w in words:
-        h = int(hashlib.md5(w.lower().encode("utf-8")).hexdigest(), 16)
-        for i in range(64):
-            v[i] += 1 if ((h >> i) & 1) else -1
-    fingerprint = 0
-    for i in range(64):
-        if v[i] > 0:
-            fingerprint |= (1 << i)
-    simhash_hex = f"0x{fingerprint:016x}"
+    simhash_hex = enh.simhash64_blake2b(raw_text)
     
     est_tokens = max(1, int(len(raw_text) / 3.8))
     target_list = ["docmost", "affine", "paperless", "obsidian", "trilium"] if params.target in ("all", None) else [params.target]
@@ -884,30 +905,37 @@ async def udh_checkpoint(params: CheckpointIn, ctx: Context) -> str:
             return "create requires name."
     
     if params.action == "list":
+        ok_s, text_s, data_s = await core.dashboard_api("/api/native/sagas")
+        if ok_s and isinstance(data_s, dict):
+            return out(text_s, data_s, params.output)
         ok, text, data = await dispatch("list_templates", {"kind": "checkpoints"})
         if not ok:
-            data = {"checkpoints": [
-                {"checkpoint_id": "cp-baseline-20261027", "name": "System Baseline Pre-Batch", "status": "active", "oplog_cursor": 1840}
-            ]}
-            text = "Active Checkpoints (1):\n• cp-baseline-20261027 (System Baseline Pre-Batch, cursor #1840)"
+            data = {"checkpoints": [], "offline_fallback": True, "detail": text}
+            text = f"Live checkpoint list unavailable ({text}). Verify UDH_DASHBOARD_URL or WF07 config."
         return out(text, data, params.output)
     
     elif params.action == "create":
         payload = {"name": params.name, "description": params.description or "Manual checkpoint"}
+        ok_n, text_n, data_n = await core.dashboard_api("/api/native/snapshot", method="POST", json_body={"label": params.name, "reason": payload["description"], "dry_run": False})
+        if ok_n:
+            return out(text_n, data_n, params.output)
         ok, text, data = await dispatch("create_checkpoint", payload)
         if not ok:
             import datetime
             cid = f"cp-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
-            data = {"checkpoint_id": cid, "name": params.name, "status": "created", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-            text = f"Created pipeline checkpoint: {params.name} ({cid})"
+            data = {"checkpoint_id": cid, "name": params.name, "status": "local_only", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+            text = f"Created local checkpoint (upstream unreachable): {params.name} ({cid})"
         return out(text, data, params.output)
     
     elif params.action == "restore":
         payload = {"checkpoint_id": params.checkpoint_id, "confirm": True}
+        ok_n, text_n, data_n = await core.dashboard_api("/api/native/saga/rollback", method="POST", json_body={"snapshot_id": params.checkpoint_id, "dry_run": False})
+        if ok_n:
+            return out(text_n, data_n, params.output)
         ok, text, data = await dispatch("rollback_checkpoint", payload)
         if not ok:
-            data = {"checkpoint_id": params.checkpoint_id, "status": "restored", "reversed_stages": 5}
-            text = f"Restored pipeline state to checkpoint '{params.checkpoint_id}' (All targets reversed)."
+            data = {"checkpoint_id": params.checkpoint_id, "status": "restore_unavailable", "detail": text}
+            text = f"Checkpoint restore failed upstream for '{params.checkpoint_id}': {text}"
         return out(text, data, params.output)
     
     else:  # delete
@@ -950,36 +978,35 @@ async def udh_tokens(params: TokensIn, ctx: Context) -> str:
     if params.action == "get_metrics":
         ok, text, data = await dispatch("get_token_burn", {})
         if not ok:
-            data = {
-                "daily_budget": 150000,
-                "total_tokens_used": 12450,
-                "pct_used": 8.3,
-                "status": "nominal",
-                "current_mode": "llm_full",
-                "estimated_cost_usd": 0.0037,
-                "is_fallback_active": False,
-            }
-            text = (
-                f"UDH Token Burn Status: {data['status'].upper()}\n"
-                f"• Tokens Used: {data['total_tokens_used']:,} / {data['daily_budget']:,} ({data['pct_used']}%)\n"
-                f"• Est. Cost:   ${data['estimated_cost_usd']}\n"
-                f"• Mode:        {data['current_mode']}"
-            )
+            ok_r, _, data_r = await core.dashboard_api("/api/settings/runtime") if core.UDH_DASHBOARD_URL else (False, "unconfigured", None)
+            if ok_r and isinstance(data_r, dict):
+                budget = int(data_r.get("token_daily_budget", 150000))
+                data = {"daily_budget": budget, "status": "runtime_config_only", "routed_via": "dashboard_runtime", "total_tokens_used": 0, "pct_used": 0.0}
+                text = f"UDH Token Burn Status: RUNTIME_CONFIG_ONLY\n• Daily Budget: {budget:,} tokens (live burn telemetry via dispatch unavailable)."
+            else:
+                data = {"status": "unavailable", "offline_fallback": True, "detail": text}
+                text = f"UDH Token Burn Status: UNAVAILABLE\n• Upstream unreachable: {text}"
         return out(text, data, params.output)
     
     elif params.action == "set_budget":
-        data = {"daily_budget": params.daily_budget, "status": "updated"}
-        text = f"Updated daily token budget to {params.daily_budget:,} tokens."
+        ok_r, text_r, data_r = await core.dashboard_api("/api/settings/runtime", method="POST", json_body={"token_daily_budget": int(params.daily_budget)})
+        if ok_r and isinstance(data_r, dict):
+            return out(f"Persisted daily token budget to {params.daily_budget:,} tokens.", data_r, params.output)
+        data = {"daily_budget": params.daily_budget, "status": "local_ack", "detail": text_r}
+        text = f"Updated daily token budget to {params.daily_budget:,} tokens (remote persist unavailable: {text_r})."
         return out(text, data, params.output)
     
     elif params.action == "toggle_fallback":
         mode = "heuristic_fallback" if params.fallback_active else "llm_full"
-        data = {"is_fallback_active": bool(params.fallback_active), "current_mode": mode}
-        text = f"Adaptive fallback updated: Mode is now '{mode}'."
+        ok_d, text_d, data_d = await dispatch("update_hub_config", {"field": "auto_enrich", "value": not bool(params.fallback_active)})
+        if ok_d:
+            return out(f"Adaptive fallback updated via hub_config: Mode is now '{mode}'.", data_d, params.output)
+        data = {"is_fallback_active": bool(params.fallback_active), "current_mode": mode, "persisted": False}
+        text = f"Adaptive fallback updated locally: Mode is now '{mode}'."
         return out(text, data, params.output)
     
     else:  # reset_today
-        data = {"status": "reset", "tokens_used": 0}
+        data = {"status": "reset", "tokens_used": 0, "note": "Local counter reset ack; backend metrics roll over at UTC midnight."}
         text = "Today's token metrics reset to 0."
         return out(text, data, params.output)
 
@@ -1044,7 +1071,7 @@ async def udh_tags(params: TagsIn, ctx: Context) -> str:
     else:  # cluster_tags
         if not _has_scope("read"):
             return "cluster_tags requires 'read' (or '*')."
-        raw_tags = params.tags or ["invoice", "invoices", "invoice-2026", "billing", "receipts", "receipt", "contract", "contracts"]
+        raw_tags = params.tags or ["invoice", "invoices", "invoice-2026", "billing", "receipts", "receipt", "legal-privilege", "lpp"]
         import difflib
         clusters = []
         visited = set()
@@ -1053,21 +1080,28 @@ async def udh_tags(params: TagsIn, ctx: Context) -> str:
                 continue
             group = [t]
             visited.add(t)
+            norm_a = enh.normalize_canonical_tag_alias(t)
             for other in raw_tags:
                 if other in visited:
                     continue
-                if difflib.SequenceMatcher(None, t.lower(), other.lower()).ratio() >= 0.65 or t in other or other in t:
+                norm_b = enh.normalize_canonical_tag_alias(other)
+                if norm_a == norm_b or difflib.SequenceMatcher(None, norm_a, norm_b).ratio() >= 0.65 or norm_a in norm_b or norm_b in norm_a:
                     group.append(other)
                     visited.add(other)
             if len(group) > 1:
-                canonical = sorted(group, key=len)[0]
+                canonical = sorted((enh.normalize_canonical_tag_alias(g) for g in group), key=len)[0]
                 clusters.append({
                     "canonical": canonical,
                     "variants": group,
-                    "count": len(group)
+                    "count": len(group),
+                    "savings_tags": len(group) - 1,
                 })
-        data = {"clusters": clusters, "total_clusters": len(clusters)}
-        text = f"Discovered {len(clusters)} tag clusters:\n" + "\n".join(f"• #{c['canonical']}: {', '.join(c['variants'])}" for c in clusters)
+        total_savings = sum(c["savings_tags"] for c in clusters)
+        data = {"clusters": clusters, "total_clusters": len(clusters), "total_savings_tags": total_savings}
+        text = (
+            f"Discovered {len(clusters)} tag clusters (savings {total_savings} redundant tags):\n"
+            + "\n".join(f"• #{c['canonical']}: {', '.join(c['variants'])}" for c in clusters)
+        )
         return out(text, data, params.output)
 
 
@@ -1095,12 +1129,15 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
     import asyncio
     dashboard_port = int(os.environ.get("UDH_DASHBOARD_PORT", 12015))
     mcp_port = int(os.environ.get("UDH_MCP_PORT", 12021))
+    pg_host = os.environ.get("UDH_PG_HOST", "127.0.0.1")
+    pg_port = int(os.environ.get("UDH_PG_PORT", 5432))
     services = [
-        {"id": "udh-dashboard", "name": "UDH Dashboard", "ports": [dashboard_port, 8080]},
-        {"id": "udh-mcp", "name": "UDH MCP Server", "ports": [mcp_port]},
-        {"id": "n8n", "name": "n8n Core", "ports": [5678]},
-        {"id": "udh-qdrant", "name": "Qdrant Vector DB", "ports": [6333]},
-        {"id": "dbackup", "name": "DBackup Engine", "ports": [8000]},
+        {"id": "udh-dashboard", "name": "UDH Dashboard", "host": "127.0.0.1", "ports": [dashboard_port, 8080]},
+        {"id": "udh-mcp", "name": "UDH MCP Server", "host": "127.0.0.1", "ports": [mcp_port]},
+        {"id": "udh-postgres", "name": "UDH Postgres 17", "host": pg_host, "ports": [pg_port]},
+        {"id": "n8n", "name": "n8n Core", "host": "127.0.0.1", "ports": [5678]},
+        {"id": "udh-qdrant", "name": "Qdrant Vector DB", "host": "127.0.0.1", "ports": [6333, 12024]},
+        {"id": "dbackup", "name": "DBackup Engine", "host": "127.0.0.1", "ports": [8000]},
     ]
 
     async def _probe_service(s: dict) -> dict:
@@ -1109,7 +1146,7 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
         active_port = s["ports"][0]
         for p in s["ports"]:
             try:
-                _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", p), timeout=0.3)
+                _, writer = await asyncio.wait_for(asyncio.open_connection(s.get("host", "127.0.0.1"), p), timeout=0.3)
                 writer.close()
                 await writer.wait_closed()
                 ok = True
@@ -1127,11 +1164,15 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
         }
 
     probed = await asyncio.gather(*(_probe_service(s) for s in services))
-    healthy_count = sum(1 for r in probed if r.pop("_ok"))
     results = list(probed)
+    dash_up = any(r["service"] == "UDH Dashboard" and r.get("_ok") for r in results)
+    worker_data = None
+    if dash_up and core.UDH_DASHBOARD_URL:
+        _, _, worker_data = await core.dashboard_api("/api/worker/status", timeout=2.0)
+    healthy_count = sum(1 for r in results if r.pop("_ok"))
 
     version_info = {
-        "version": os.getenv("UDH_MCP_VERSION", "2.4.0"),
+        "version": os.getenv("UDH_MCP_VERSION", "2.7.0"),
         "git_sha": os.getenv("UDH_MCP_GIT_SHA", "dev"),
         "build_date": os.getenv("UDH_MCP_BUILD_DATE", "unknown"),
     }
@@ -1140,6 +1181,7 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
         "healthy_count": healthy_count,
         "total_count": len(services),
         "version": version_info,
+        "worker_alive": bool(isinstance(worker_data, dict) and worker_data.get("alive")),
         "services": results,
     }
     text = (
@@ -1152,28 +1194,30 @@ async def udh_fleet(params: FleetIn, ctx: Context) -> str:
 
 class ExtractInput(BaseModel):
     model_config = M
-    text: str = Field(..., min_length=1, description="Document text or Markdown to extract metadata from or prepare as sanitized LLM context.")
+    text: str = Field(..., min_length=1, description="Document text or Markdown to extract metadata from or prepare locally.")
     action: str = Field(
         "extract",
-        description="'extract' (zero-token legal/entity extraction & SimHash) | 'context_prepare' (mojibake repair, injection neutralization, readability & hierarchical chunk packing).",
-        pattern=r"^(extract|context_prepare)$",
+        description="'extract' (legal/entity extraction & SimHash) | 'context_prepare' (mojibake, injections, chunks) | 'redact_preview' (zero-token UK PII scrubber) | 'readability' (Flesch/FK & dialect) | 'chunk_markdown' (heading-breadcrumb packing) | 'conflict_scan' (GBP/date divergence).",
+        pattern=r"^(extract|context_prepare|redact_preview|readability|chunk_markdown|conflict_scan)$",
     )
     target_register: str = Field(
         "preserve",
         description="Target language register for action='context_prepare': 'preserve' | 'plain_english' | 'legal_forensic'.",
         pattern=r"^(preserve|plain_english|legal_forensic)$",
     )
-    token_budget: int = Field(1200, ge=100, le=16000, description="Target prompt token budget for action='context_prepare'.")
+    token_budget: int = Field(1200, ge=100, le=16000, description="Target prompt token budget for chunk packing.")
+    redact_profile: str = Field("tribunal_public", description="PII profile for action='redact_preview': 'tribunal_public' | 'counsel_full'.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
 @server.tool(
     name="udh_extract",
-    title="UDH Zero-Token Extract & Context Prep",
+    title="UDH Zero-Token Extract & Context Suite",
     description=(
-        "Zero-token deterministic extraction & context preparation: action='extract' extracts UK neutral citations, "
-        "statutes, GBP currency, emails, dates, headings, and 64-bit SimHash; action='context_prepare' repairs mojibake, "
-        "neutralizes prompt injections, scores readability, and packs heading-breadcrumb Markdown chunks within token_budget."
+        "Zero-token deterministic NLP suite: action='extract' extracts UK citations/statutes/currency/SimHash; "
+        "'context_prepare' repairs mojibake, neutralizes prompt injections & chunks Markdown; "
+        "'redact_preview' scrubs NHS/NINO/email/postcode PII; 'readability' scores Flesch ease & UK/US dialect; "
+        "'chunk_markdown' splits preserving code/tables; 'conflict_scan' detects competing GBP amounts & dates."
     ),
     annotations=RD,
 )
@@ -1183,19 +1227,36 @@ async def udh_extract(params: ExtractInput) -> str:
     import re
 
     src = params.text
+    if params.action == "redact_preview":
+        red = enh.redact_sensitive_pii(src, profile=params.redact_profile)
+        return out(
+            f"Zero-Token PII Redaction ({red['total_redactions']} masked, profile={params.redact_profile})\n\n{red['text']}",
+            {**red, "tokens_burned": 0},
+            params.output,
+        )
+    if params.action == "readability":
+        rb = enh.analyze_readability_and_dialect(src)
+        return out(
+            f"Readability ({rb['words']} words, avg {rb.get('avg_sentence_length', 0)}w/sent, Flesch {rb['flesch_ease']}, FK Grade {rb['fk_grade']}, dialect {rb['dialect']})",
+            {**rb, "tokens_burned": 0},
+            params.output,
+        )
+    if params.action == "chunk_markdown":
+        ck = enh.chunk_markdown_hierarchical(src, token_budget=params.token_budget)
+        return out(
+            f"Hierarchical Markdown Chunker ({ck['chunk_count']}/{ck['total_blocks']} blocks, {ck['tokens_used']}/{ck['token_budget']} tokens)",
+            {**ck, "tokens_burned": 0},
+            params.output,
+        )
+    if params.action == "conflict_scan":
+        cs = enh.detect_numeric_date_conflicts(src)
+        return out(
+            f"Conflict Scan: {'WARNINGS' if cs['has_conflicts'] else 'CLEAN'} ({len(cs['currency_gbp'])} GBP sums, {len(cs['dates'])} dates)",
+            {**cs, "tokens_burned": 0},
+            params.output,
+        )
     if params.action == "context_prepare":
-        repaired = src
-        mojibake_hits = 0
-        for bad, good in (
-            ("\u00e2\u20ac\u201d", "\u2014"),
-            ("\u00e2\u20ac\u201c", "\u2013"),
-            ("\u00e2\u20ac\u2122", "'"),
-            ("\u00c2\u00a3", "\u00a3"),
-        ):
-            if bad in repaired:
-                mojibake_hits += repaired.count(bad)
-                repaired = repaired.replace(bad, good)
-
+        repaired, mojibake_hits = enh.repair_mojibake(src)
         repaired = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", repaired)
         inj_hits = 0
         for inj_pat in (
@@ -1213,50 +1274,36 @@ async def udh_extract(params: ExtractInput) -> str:
             repaired = re.sub(r"\borganization\b", "organisation", repaired)
             repaired = re.sub(r"\banalyze\b", "analyse", repaired)
 
-        words = re.findall(r"[A-Za-z0-9']+", repaired)
-        sents = max(1, len([s for s in re.split(r"[.!?\n]+", repaired) if s.strip()]))
-        asl = round(len(words) / sents, 1)
-        chunks: list[dict[str, object]] = []
-        heading_ctx = "Document Root"
-        for para in [p.strip() for p in re.split(r"\n{2,}", repaired) if p.strip()]:
-            hm = re.match(r"^#{1,6}\s+(.+)", para)
-            if hm:
-                heading_ctx = hm.group(1).strip()
-            tok = max(1, math.ceil(len(para) / 4.0))
-            chunks.append({"breadcrumb": heading_ctx, "tokens": tok, "text": f"[Context: {heading_ctx}]\n{para}"})
-
-        packed: list[dict[str, object]] = []
-        used_tokens = 0
-        for ch in chunks:
-            t = int(ch["tokens"])  # type: ignore[arg-type]
-            if used_tokens + t <= params.token_budget or not packed:
-                packed.append(ch)
-                used_tokens += t
-
+        ck = enh.chunk_markdown_hierarchical(repaired, token_budget=params.token_budget)
+        rb = enh.analyze_readability_and_dialect(repaired)
+        packed = ck["chunks"]
+        prepared_text = "\n\n---\n\n".join(str(c["text"]) for c in packed)
         data = {
             "action": "context_prepare",
             "register": params.target_register,
             "mojibake_repaired": mojibake_hits,
             "injections_neutralized": inj_hits,
-            "word_count": len(words),
-            "avg_sentence_length": asl,
-            "chunk_count": len(chunks),
-            "selected_chunks": len(packed),
-            "tokens_used": used_tokens,
+            "word_count": rb["words"],
+            "avg_sentence_length": rb.get("avg_sentence_length", 0.0),
+            "flesch_ease": rb["flesch_ease"],
+            "dialect": rb["dialect"],
+            "chunk_count": ck["total_blocks"],
+            "selected_chunks": ck["chunk_count"],
+            "tokens_used": ck["tokens_used"],
             "token_budget": params.token_budget,
-            "prepared_text": "\n\n---\n\n".join(str(c["text"]) for c in packed),
+            "prepared_text": prepared_text,
             "tokens_burned": 0,
         }
         text = (
-            f"Context Prepare ({len(packed)}/{len(chunks)} chunks, {used_tokens}/{params.token_budget} tokens, avg sentence {asl}w)\n"
+            f"Context Prepare ({ck['chunk_count']}/{ck['total_blocks']} chunks, {ck['tokens_used']}/{params.token_budget} tokens, Flesch {rb['flesch_ease']})\n"
             f"• Mojibake fixed: {mojibake_hits} | Injections neutralized: {inj_hits} | Register: {params.target_register}\n\n"
-            f"{data['prepared_text']}"
+            f"{prepared_text}"
         )
         return out(text, data, params.output)
     words = re.findall(r"\S+", src)
     headings = re.findall(r"^#{1,6}\s+(.+)$", src, flags=re.MULTILINE)
-    case_refs = sorted(set(re.findall(r"\[\d{4}\]\s+(?:EWCA\s+Civ|UKEAT|UKSC|EWHC|ICR|IRLR)\s+[\w\d]+", src)))
-    statutes = sorted(set(re.findall(r"(?:Employment Rights Act 1996|Equality Act 2010|ACAS Code|ERA 1996|GDPR|Data Protection Act 2018)", src, flags=re.IGNORECASE)))
+    case_refs = sorted(set(re.findall(r"\[\d{4}\]\s+(?:EWCA\s+Civ|UKEAT|UKSC|EWHC|ET|ICR|IRLR)\s+[\w\d]+", src)))
+    statutes = sorted(set(re.findall(r"(?:Employment Rights Act 1996|Equality Act 2010|Public Interest Disclosure Act 1998|Data Protection Act 2018|CPR 35|ACAS Code|ERA 1996|GDPR)", src, flags=re.IGNORECASE)))
     currencies = sorted(set(re.findall(r"£\s?\d[\d,]*(?:\.\d{1,2})?", src)))
     emails = sorted(set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", src)))
     dates = sorted(set(re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b", src)))
@@ -1321,12 +1368,20 @@ async def udh_bundle_seal(params: BundleSealInput) -> str:
     ts = datetime.now(timezone.utc).isoformat()
     payload = f"{params.doc_id}|{params.actor}|{ts}|{params.content}".encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()
+    est_bytes = len(params.content.encode("utf-8"))
+    est_pages = max(1, (est_bytes // 2200) + 1)
+    est_mb = round(max(0.01, est_bytes / (1024 * 1024)), 3)
     data: dict[str, Any] = {
         "doc_id": params.doc_id,
         "actor": params.actor,
         "timestamp_utc": ts,
         "sha256": digest,
         "seal_short": digest[:12].upper(),
+        "hmcts_compliance": {
+            "estimated_pages": est_pages,
+            "estimated_size_mb": est_mb,
+            "under_50mb_limit": est_mb <= 50.0,
+        },
     }
 
     sol_line = ""
@@ -1354,25 +1409,30 @@ async def udh_bundle_seal(params: BundleSealInput) -> str:
 
 class DictionaryIn(BaseModel):
     model_config = M
-    resource: str = Field("dictionary", description="'dictionary' | 'errors' | 'error_code' | 'context_language' (50-point Context & Language catalog).")
-    domain: Optional[str] = Field(None, description="Optional domain filter (core_tables, target_adapters, frontmatter, apis, mcp) or context pillar filter.")
+    resource: str = Field("dictionary", description="'dictionary' | 'errors' | 'error_code' | 'context_language' | 'mcp_features' (50-Feature MCP catalog).")
+    domain: Optional[str] = Field(None, description="Optional domain filter (core_tables, target_adapters, frontmatter, apis, mcp) or pillar/category filter.")
     query: Optional[str] = Field(None, description="Optional search query or UDH-XXX error code.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
 
 
-@server.tool(name="udh_dictionary", title="UDH Data Dictionary, Error & Context Catalog", annotations=RD)
+@server.tool(name="udh_dictionary", title="UDH Data Dictionary, Error & Catalog Suite", annotations=RD)
 @_logged_tool
 async def udh_dictionary(params: DictionaryIn, ctx: Context) -> str:
-    """Query UDH Dashboard's Data Dictionary (/api/dictionary), 100-item
-    Error & Fallback Catalog (/api/errors/catalog or /api/errors/{code}),
-    or 50-point Context & Language catalog (/api/context-language/catalog).
+    """Query UDH Dashboard's Data Dictionary, Error Catalog, Context & Language catalog,
+    or local 50-Feature MCP Programme catalog ('mcp_features').
     Read-only — requires 'read' scope.
     """
     if not _has_scope("read"):
         return "This token isn't scoped for udh_dictionary — needs 'read' (or '*')."
     from urllib.parse import urlencode
+    import json as _jd
 
     res = params.resource.strip().lower()
+    if res == "mcp_features":
+        items = enh.get_mcp_feature_catalog(pillar=params.domain, query=params.query)
+        summary = enh.get_mcp_feature_summary()
+        payload = {**summary, "pillars_list": enh.MCP_PILLARS, "count": len(items), "features": items}
+        return out(_jd.dumps(payload, indent=2), payload, params.output)
     if res == "error_code":
         code = (params.query or "").strip()
         if not code:
@@ -1380,6 +1440,11 @@ async def udh_dictionary(params: DictionaryIn, ctx: Context) -> str:
         ok, text, data = await core.dashboard_api(f"/api/errors/{code}")
     elif res == "errors":
         ok, text, data = await core.dashboard_api("/api/errors/catalog")
+        if ok and params.query and isinstance(data, dict) and isinstance(data.get("entries"), list):
+            q = params.query.lower()
+            filtered = [e for e in data["entries"] if q in str(e).lower()]
+            data = {**data, "filtered_count": len(filtered), "entries": filtered}
+            text = _jd.dumps(data, indent=2, default=str)
     elif res == "context_language":
         qs = urlencode({k: v for k, v in (("category", params.domain), ("q", params.query)) if v})
         path = f"/api/context-language/catalog?{qs}" if qs else "/api/context-language/catalog"
@@ -1515,27 +1580,28 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
     if act == "quickstart":
         sheet = {
             "Read & Inspect (safe, no mutations)": [
-                "udh_dashboard() -> Live doc counts, targets, conflicts, quarantine",
-                "udh_query(kind='search_documents', query='...') -> Search canonical docs",
-                "udh_dictionary(resource='error_code', query='UDH-004') -> Error & schema lookup",
-                "udh_fleet(action='get_status') -> Concurrent container latency probe",
-                "udh_setup(action='status|connect_guide') -> Connection & migration status",
+                "udh_dashboard() -> Live snapshot + degraded/conflict/pause alert banners",
+                "udh_query(kind='get_content', sanitize_pii=true) -> Canonical docs & PII scrubbing",
+                "udh_dictionary(resource='mcp_features|context_language|errors') -> Catalogs & 50-feature MCP list",
+                "udh_fleet(action='get_status') -> Dashboard/MCP/Postgres/n8n/Qdrant/DBackup/Worker probe",
+                "udh_setup(action='status|parity|cutover_check|wiring_check|bootstrap_pg') -> Readiness suite",
             ],
-            "Stage 2 Scheduler & Safe Previews (dry_run=true by default)": [
-                "udh_scheduler(action='status') -> List 5 Stage 2 Python cron jobs",
-                "udh_scheduler(action='run', job_id='wf08_health_digest', dry_run=true) -> Safe preview",
-                "udh_simulate(scenario_key='et_witness_statement') -> 5-stage pipeline dry-run",
-                "udh_updates(action='check_updates') -> Check GitHub vs running build",
+            "Zero-Token NLP & Safe Previews (0 LLM tokens burned)": [
+                "udh_extract(action='extract|context_prepare|redact_preview|readability|chunk_markdown|conflict_scan') -> Deterministic NLP",
+                "udh_bundle_seal(...) -> SHA-256 seal + HMCTS <50MB estimate + Schedule of Loss",
+                "udh_scheduler(action='status|run') -> Inspect or preview 6 Stage 2 Python cron jobs",
+                "udh_simulate(...) -> 5-stage pipeline dry-run with Blake2b SimHash",
+                "udh_updates(action='check_version|check_updates') -> Build SHA comparison",
             ],
-            "Sync & Control (requires 'sync' scope; confirm=true for writes)": [
-                "udh_control(paused=true) -> Emergency global pause",
-                "udh_targets(target_id='trilium', enabled=true) -> Toggle a target",
-                "udh_config(action='get_runtime_settings|update_runtime_settings') -> Runtime Option E & hub/target settings",
-                "udh_sync(action='scan_drift') -> Trigger drift scan",
+            "Sync & Control ('sync' scope; confirm=true for live writes)": [
+                "udh_control(paused=true) / udh_targets(...) -> Emergency pause & target gates",
+                "udh_config(action='get_runtime_settings|update_runtime_settings|reset_runtime_settings') -> Runtime config",
+                "udh_sync(action='scan_drift|propagate_paperless|reindex_vectors') -> Sync & vector batch",
+                "udh_health(action='check_health|check_integrity|wiring_check') -> Health & wiring",
+                "udh_adapters(action='list|dispatch|pipeline|bridges|run_bridge|dlq|replay_dlq|webhook_ingest') -> Stage 3/4 control",
             ],
-            "Destructive / Admin (requires 'admin' scope + confirm=true)": [
-                "udh_conflicts(...) -> Resolve document conflict",
-                "udh_lifecycle(action='rollback|purge_ingested', confirm=true) -> Restore or purge",
+            "Destructive / Admin ('admin' scope + confirm=true)": [
+                "udh_conflicts(...) / udh_lifecycle(...) / udh_checkpoint(...) / udh_tags(...) -> Recovery & merges",
             ],
         }
         return out(json.dumps(sheet, indent=2), sheet, params.output)
@@ -1544,7 +1610,10 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
     ok_mig, _, mig_data = await core.dashboard_api("/api/migration/status")
     ok_ver, _, ver_data = await core.dashboard_api("/api/version")
     status_payload = {
+        "mcp_version": os.getenv("UDH_MCP_VERSION", "2.7.0"),
+        "mcp_features": enh.get_mcp_feature_summary(),
         "mcp_backend_mode": core.UDH_BACKEND_MODE,
+        "mcp_runtime_override": core.RUNTIME_MODE_OVERRIDE,
         "mcp_prefer_native": core.UDH_PREFER_NATIVE,
         "dashboard_url": core.UDH_DASHBOARD_URL,
         "env_configured": {
@@ -1554,6 +1623,7 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
             "WF14_URL": bool(core.WF14_URL),
             "WF16_URL": bool(core.WF16_URL),
         },
+        "transport_stats": core.get_transport_stats(),
         "dashboard_reachable": ok_mig or ok_ver,
         "dashboard_version": ver_data if ok_ver else None,
         "migration_status": mig_data if ok_mig else None,
@@ -1566,7 +1636,7 @@ class SchedulerIn(BaseModel):
     action: str = Field("status", description="'status' | 'run' | 'toggle'.")
     job_id: Optional[str] = Field(
         None,
-        description="Stage 2 job ID: wf05a_inbound_sync, wf05b_outbound_sync, wf08_health_digest, wf12_drift_scanner, wf20_silent_drift_sweeper.",
+        description="Stage 2 job ID: wf05a_inbound_sync, wf05b_outbound_sync, wf08_health_digest, wf12_drift_scanner, wf17_vector_reindex, wf20_silent_drift_sweeper.",
     )
     dry_run: bool = Field(True, description="Defaults to True for safe preview. Pass dry_run=false + confirm=true to execute.")
     enabled: Optional[bool] = Field(None, description="Required when action='toggle'.")
@@ -1749,10 +1819,15 @@ async def udh_adapters(params: AdaptersIn, ctx: Context) -> str:
     if act == "run_bridge":
         if not params.adapter_id:
             return "adapter_id (bridge_id) is required for action='run_bridge' (e.g. 'legal_phase1_trilium_import')."
+        body_bridge: dict = {"bridge_id": params.adapter_id, "dry_run": params.dry_run}
+        if params.doc_id and params.doc_id != "doc-preview":
+            body_bridge["doc_id"] = params.doc_id
+        if params.content:
+            body_bridge["content"] = params.content
         ok, text, data = await core.dashboard_api(
             "/api/stage4/bridges/run",
             method="POST",
-            json_body={"bridge_id": params.adapter_id, "dry_run": params.dry_run},
+            json_body=body_bridge,
         )
         if not ok:
             return f"Stage 4 bridge run failed: {text}"

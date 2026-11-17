@@ -1,6 +1,6 @@
 # udh-mcp
 
-Standalone MCP server for matrix-homelab's **Universal Document Hub (UDH)** — providing **22 tools** with full parity with UDH Dashboard, Option E Strangler-Fig native backend routing (`/api/native/*`), Stage 2 Python scheduler control (`udh_scheduler`), Stage 3 Python target adapters (`udh_adapters`), and zero-config setup helpers (`udh_setup`).
+Standalone MCP server (v2.7.0) for matrix-homelab's **Universal Document Hub (UDH)** — providing **22 tools** and a **50-Feature MCP Programme** (`mcp_enhancements.py`, inspectable via `udh_dictionary(resource="mcp_features")`) with full parity with UDH Dashboard, Option E Strangler-Fig native backend routing (`/api/native/*`), Stage 2 Python scheduler control (`udh_scheduler`), Stage 3/4 Python target adapters (`udh_adapters`), zero-token PII/readability/chunking/conflict NLP (`udh_extract`), and readiness/wiring verification (`udh_setup`).
 
 Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` for the architecture and why.
 

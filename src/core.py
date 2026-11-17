@@ -22,11 +22,16 @@ fails with a clear message rather than a confusing one if unset):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import time
+import uuid
 from typing import Optional
 
 import httpx
+
+import mcp_enhancements as enh
 
 WF07_URL = os.environ.get("WF07_URL", "").strip().rstrip("/")
 WF07_AUTH_TOKEN = os.environ.get("WF07_AUTH_TOKEN", "").strip()
@@ -63,6 +68,32 @@ def _use_native_backend() -> bool:
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 _POOL_CLIENT: Optional[httpx.AsyncClient] = None
+_TRANSPORT_STATS: dict[str, dict[str, float]] = {}
+_READ_CACHE: dict[str, tuple[float, tuple]] = {}
+
+
+def _record_transport(backend: str, duration_ms: float, ok: bool) -> None:
+    s = _TRANSPORT_STATS.setdefault(backend, {"calls": 0, "errors": 0, "total_ms": 0.0, "last_ms": 0.0})
+    s["calls"] += 1
+    if not ok:
+        s["errors"] += 1
+    s["total_ms"] = round(s["total_ms"] + duration_ms, 2)
+    s["last_ms"] = round(duration_ms, 2)
+
+
+def get_transport_stats() -> dict[str, dict[str, float]]:
+    return {k: dict(v) for k, v in _TRANSPORT_STATS.items()}
+
+
+def invalidate_read_cache(prefix: str = "") -> int:
+    if not prefix:
+        n = len(_READ_CACHE)
+        _READ_CACHE.clear()
+        return n
+    keys = [k for k in _READ_CACHE if k.startswith(prefix)]
+    for k in keys:
+        _READ_CACHE.pop(k, None)
+    return len(keys)
 
 
 def _get_pooled_client() -> httpx.AsyncClient:
@@ -76,31 +107,46 @@ def _get_pooled_client() -> httpx.AsyncClient:
 
 
 async def _http_call(method: str, url: str, *, headers: Optional[dict] = None,
-                     json_body: Optional[dict] = None, timeout: float = 30.0) -> httpx.Response:
-    """Execute an HTTP call using the shared connection pool with bounded live transient retry."""
+                     json_body: Optional[dict] = None, timeout: float = 30.0,
+                     backend_label: str = "http") -> httpx.Response:
+    """Execute an HTTP call using the shared connection pool with correlation ID, stats & bounded retry."""
+    req_headers = {**(headers or {}), "X-Request-ID": uuid.uuid4().hex[:12]}
+    t0 = time.monotonic()
     if httpx.AsyncClient is not _REAL_ASYNC_CLIENT:
         async with httpx.AsyncClient(timeout=timeout) as h:
-            if method.upper() == "GET":
-                return await h.get(url, headers=headers)
-            return await getattr(h, method.lower())(url, headers=headers, json=json_body)
+            try:
+                resp = await (h.get(url, headers=req_headers) if method.upper() == "GET" else getattr(h, method.lower())(url, headers=req_headers, json=json_body))
+                _record_transport(backend_label, (time.monotonic() - t0) * 1000.0, resp.status_code < 400)
+                return resp
+            except Exception:
+                _record_transport(backend_label, (time.monotonic() - t0) * 1000.0, False)
+                raise
     import asyncio
     client = _get_pooled_client()
     for attempt in range(2):
         try:
-            resp = await client.request(method, url, headers=headers, json=json_body, timeout=timeout)
+            resp = await client.request(method, url, headers=req_headers, json=json_body, timeout=timeout)
             if resp.status_code in (429, 502, 503, 504) and attempt == 0:
                 await asyncio.sleep(0.1)
                 continue
+            _record_transport(backend_label, (time.monotonic() - t0) * 1000.0, resp.status_code < 400)
             return resp
         except httpx.TransportError:
             if attempt == 1:
+                _record_transport(backend_label, (time.monotonic() - t0) * 1000.0, False)
                 raise
             await asyncio.sleep(0.1)
 
 
 async def dashboard_api(path: str, method: str = "GET",
-                        json_body: Optional[dict] = None, timeout: float = 15.0) -> tuple:
-    """Call UDH Dashboard REST API (/api/dictionary, /api/errors, /api/version, /api/updates)."""
+                        json_body: Optional[dict] = None, timeout: float = 15.0,
+                        cache_ttl: float = 0.0) -> tuple:
+    """Call UDH Dashboard REST API with optional TTL caching and sanitized error hints."""
+    cache_key = f"dash:{method}:{path}"
+    if cache_ttl > 0 and method.upper() == "GET" and httpx.AsyncClient is _REAL_ASYNC_CLIENT:
+        cached = _READ_CACHE.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < cache_ttl:
+            return cached[1]
     url = f"{UDH_DASHBOARD_URL}{path}"
     headers = {"Accept": "application/json"}
     api_token = os.environ.get("UDH_API_TOKEN", "").strip()
@@ -109,13 +155,17 @@ async def dashboard_api(path: str, method: str = "GET",
         headers["X-UDH-API-Token"] = api_token
     try:
         r = await _http_call(method, url, headers=headers,
-                             json_body=json_body, timeout=timeout)
+                             json_body=json_body, timeout=timeout, backend_label="dashboard_api")
         if r.status_code != 200:
-            return False, f"HTTP {r.status_code}: {r.text[:300]}", None
+            err = enh.map_http_status_to_udh_error(r.status_code, r.text[:300])
+            return False, f"HTTP {r.status_code} ({err['error_code']}): {err['remediation']} | {enh.sanitize_secrets(r.text[:200])}", None
         data = r.json() if r.content else {}
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}", None
-    return True, json.dumps(data, indent=2, default=str), data
+        return False, f"{type(e).__name__}: {enh.sanitize_secrets(str(e))}", None
+    res = (True, json.dumps(data, indent=2, default=str), data)
+    if cache_ttl > 0 and method.upper() == "GET" and httpx.AsyncClient is _REAL_ASYNC_CLIENT:
+        _READ_CACHE[cache_key] = (time.monotonic(), res)
+    return res
 
 # WF-07's own Global Pause Gate node (matrix-homelab's n8n-workflows/
 # wf07_adhoc_dispatch.json VALID_ACTIONS list) -- keep in sync if that
@@ -132,7 +182,8 @@ DISPATCH_ACTIONS = [
     "publish", "ingest", "reenrich", "resolve_conflict", "rollback",
     "scan_drift", "confirm_delete", "scrape_url", "release_quarantine",
     "set_global_pause", "set_target_enabled", "snapshot", "sync_outbound",
-    "backfill_trilium", "update_hub_config", "update_target_config",
+    "backfill_trilium", "propagate_paperless", "reindex_vectors",
+    "update_hub_config", "update_target_config",
     "check_health", "check_integrity", "purge_ingested", "list_templates",
     "create_template", "update_template", "delete_template",
     "set_default_template", "dry_run_pipeline", "create_checkpoint",
@@ -162,6 +213,7 @@ async def _dispatch_native(action: str, payload: Optional[dict], timeout: float)
     )
     if not ok:
         return False, text, data
+    invalidate_read_cache()
     if isinstance(data, dict) and data.get("halted"):
         return False, data.get("message") or f"Native gate halted action '{action}'", data
     if isinstance(data, dict):
@@ -173,25 +225,30 @@ async def _dispatch_n8n(action: str, payload: Optional[dict], timeout: float) ->
     if not WF07_URL or not WF07_AUTH_TOKEN:
         return False, "WF07_URL / WF07_AUTH_TOKEN not configured.", None
     body = {"action": action, **(payload or {})}
+    idem = hashlib.sha256(f"{action}:{json.dumps(body, sort_keys=True, default=str)}".encode("utf-8")).hexdigest()[:16]
     try:
         r = await _http_call(
             "POST",
             WF07_URL,
             headers={WF07_AUTH_HEADER_NAME: WF07_AUTH_TOKEN,
+                     "X-UDH-Idempotency-Key": idem,
                      "Content-Type": "application/json",
                      "Accept": "application/json"},
             json_body=body,
             timeout=timeout,
+            backend_label="n8n_wf07",
         )
         if r.status_code != 200:
-            return False, f"HTTP {r.status_code}: {r.text[:300]}", None
+            err = enh.map_http_status_to_udh_error(r.status_code, r.text[:300])
+            return False, f"HTTP {r.status_code} ({err['error_code']}): {err['remediation']}", None
         try:
             data = r.json() if r.content else {}
         except Exception:
-            return False, f"WF-07 response was not valid JSON: {r.text[:300]}", None
+            return False, f"WF-07 response was not valid JSON: {enh.sanitize_secrets(r.text[:300])}", None
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}", None
+        return False, f"{type(e).__name__}: {enh.sanitize_secrets(str(e))}", None
 
+    invalidate_read_cache()
     if isinstance(data, dict) and data.get("halted"):
         return False, data.get("message") or f"WF-07 halted action '{action}'", data
     if isinstance(data, dict):
@@ -236,6 +293,7 @@ async def _dashboard_n8n(timeout: float) -> tuple:
             WF14_URL,
             headers={WF14_AUTH_HEADER_NAME: WF14_AUTH_TOKEN, "Accept": "application/json"},
             timeout=timeout,
+            backend_label="n8n_wf14",
         )
         if r.status_code != 200:
             return False, f"HTTP {r.status_code}: {r.text[:300]}", None
@@ -309,6 +367,7 @@ async def _query_n8n(kind: str, params: Optional[dict], timeout: float) -> tuple
                      "Accept": "application/json"},
             json_body=body,
             timeout=timeout,
+            backend_label="n8n_wf16",
         )
         if r.status_code != 200:
             return False, f"HTTP {r.status_code}: {r.text[:300]}", None
