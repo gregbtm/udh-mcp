@@ -1551,9 +1551,15 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
             return f"Site wiring self-check failed: {text}"
         return out(text, data, params.output)
     if act == "connect_guide":
+        pub_url = os.getenv("UDH_PUBLIC_URL", "https://udh.nasmatrix.app").rstrip("/")
+        dash_pub = os.getenv("UDH_DASHBOARD_PUBLIC_URL", "https://udh-dashboard.nasmatrix.app").rstrip("/")
+        mcp_port = os.getenv("UDH_MCP_PORT", "12021")
         guide = {
-            "public_endpoint": os.getenv("UDH_PUBLIC_URL", "https://udh.nasmatrix.app").rstrip("/") + "/mcp",
-            "local_host_endpoint": f"http://127.0.0.1:{os.getenv('UDH_MCP_PORT', '12021')}/mcp",
+            "validation_ui": f"{dash_pub}/settings/mcp",
+            "validation_api": "POST /api/mcp/validate",
+            "options_api": "GET /api/mcp/options",
+            "public_endpoint": f"{pub_url}/mcp",
+            "local_host_endpoint": f"http://127.0.0.1:{mcp_port}/mcp",
             "transport": "streamable-http",
             "auth_header": "Authorization: Bearer <UDH_AUTH_TOKEN>",
             "scopes": {
@@ -1561,10 +1567,17 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
                 "sync": "All read tools + udh_sync, udh_targets, udh_control, udh_health, udh_config(update_*/reset_*), udh_templates, udh_simulate, udh_checkpoint, udh_tokens, udh_tags, udh_updates(trigger_update), udh_scheduler(run/toggle)",
                 "admin": "All sync tools + udh_conflicts, udh_lifecycle (destructive operations)",
             },
+            "connection_options": {
+                "1_remote_https": {"url": f"{pub_url}/mcp", "scope": "admin/sync", "transport": "streamable-http"},
+                "2_local_loopback": {"url": f"http://127.0.0.1:{mcp_port}/mcp", "scope": "admin/sync", "transport": "streamable-http"},
+                "3_readonly_scoped": {"url": f"{pub_url}/mcp", "token_env": "UDH_AUTH_TOKEN_READONLY", "scope": "read"},
+                "4_local_stdio": {"command": "python -m src.server", "env": {"UDH_MCP_TRANSPORT": "stdio"}},
+                "5_curl_probe": f"curl -fsS {pub_url}/healthz",
+            },
             "antigravity_or_cursor_mcp_config": {
                 "mcpServers": {
                     "udh-mcp": {
-                        "serverUrl": "https://udh.nasmatrix.app/mcp",
+                        "serverUrl": f"{pub_url}/mcp",
                         "headers": {"Authorization": "Bearer ${UDH_AUTH_TOKEN}"},
                     }
                 }
