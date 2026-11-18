@@ -388,8 +388,9 @@ class SyncIn(BaseModel):
         "Action-specific fields, passed through verbatim to WF-07 alongside "
         "'action'. See matrix-homelab's n8n-udh-workflow-facts skill and "
         "docs/udh/04-udh-architecture.md for each action's exact fields. "
-        "snapshot needs {'doc_id': ...}; sync_outbound and backfill_trilium "
-        "take no required fields."))
+        "snapshot needs {'doc_id': ...}; sync_outbound accepts optional "
+        "{'target_id'/'explicit_targets', 'doc_ids', 'folder', 'include_enriched', 'limit', 'force'} "
+        "to manually convert/migrate docs onto paused endpoints."))
 
 
 _SYNC_ACTIONS = {"publish", "ingest", "reenrich", "scan_drift", "scrape_url",
@@ -516,7 +517,7 @@ async def udh_lifecycle(params: LifecycleIn, ctx: Context) -> str:
     repeated sync errors — confirms the underlying issue is fixed), or
     purge_ingested (permanently delete every document doc_registry itself
     recorded as ingested into one target — trilium/obsidian/paperless/
-    affine/notion only; never touches a document added to that target by
+    affine/notion/nocodb/docmost; never touches a document added to that target by
     any other means, since it identifies documents strictly by the
     per-row ID column doc_registry sets only when UDH's own outbound sync
     wrote there. THIS IS IRREVERSIBLE from UDH's side even where the
@@ -908,12 +909,10 @@ async def udh_checkpoint(params: CheckpointIn, ctx: Context) -> str:
         ok_s, text_s, data_s = await core.dashboard_api("/api/native/sagas")
         if ok_s and isinstance(data_s, dict):
             return out(text_s, data_s, params.output)
-        ok, text, data = await dispatch("list_templates", {"kind": "checkpoints"})
-        if not ok:
-            data = {"checkpoints": [], "offline_fallback": True, "detail": text}
-            text = f"Live checkpoint list unavailable ({text}). Verify UDH_DASHBOARD_URL or WF07 config."
+        data = {"ok": False, "checkpoints": [], "offline_fallback": True, "detail": text_s}
+        text = f"Live checkpoint list unavailable ({text_s}). Verify UDH_DASHBOARD_URL or dashboard service."
         return out(text, data, params.output)
-    
+
     elif params.action == "create":
         payload = {"name": params.name, "description": params.description or "Manual checkpoint"}
         ok_n, text_n, data_n = await core.dashboard_api("/api/native/snapshot", method="POST", json_body={"label": params.name, "reason": payload["description"], "dry_run": False})
@@ -921,10 +920,8 @@ async def udh_checkpoint(params: CheckpointIn, ctx: Context) -> str:
             return out(text_n, data_n, params.output)
         ok, text, data = await dispatch("create_checkpoint", payload)
         if not ok:
-            import datetime
-            cid = f"cp-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
-            data = {"checkpoint_id": cid, "name": params.name, "status": "local_only", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-            text = f"Created local checkpoint (upstream unreachable): {params.name} ({cid})"
+            data = {"ok": False, "persisted": False, "name": params.name, "status": "unavailable", "detail": text}
+            text = f"Checkpoint '{params.name}' could not be persisted upstream ({text})."
         return out(text, data, params.output)
     
     elif params.action == "restore":
@@ -1001,8 +998,8 @@ async def udh_tokens(params: TokensIn, ctx: Context) -> str:
         ok_d, text_d, data_d = await dispatch("update_hub_config", {"field": "auto_enrich", "value": not bool(params.fallback_active)})
         if ok_d:
             return out(f"Adaptive fallback updated via hub_config: Mode is now '{mode}'.", data_d, params.output)
-        data = {"is_fallback_active": bool(params.fallback_active), "current_mode": mode, "persisted": False}
-        text = f"Adaptive fallback updated locally: Mode is now '{mode}'."
+        data = {"ok": False, "is_fallback_active": bool(params.fallback_active), "requested_mode": mode, "persisted": False, "detail": text_d}
+        text = f"Adaptive fallback update failed upstream ({text_d}); hub_config was not changed."
         return out(text, data, params.output)
     
     else:  # reset_today
@@ -1050,8 +1047,8 @@ async def udh_tags(params: TagsIn, ctx: Context) -> str:
         
         ok, text, data = await dispatch("cluster_tags", {"action": "consolidate", "canonical": params.canonical_tag, "deprecated": params.deprecated_tags})
         if not ok:
-            data = {"canonical": params.canonical_tag, "merged_count": len(params.deprecated_tags), "status": "success"}
-            text = f"Successfully merged {len(params.deprecated_tags)} tags into #{params.canonical_tag}."
+            data = {"ok": False, "persisted": False, "canonical": params.canonical_tag, "status": "unavailable", "detail": text}
+            text = f"Tag consolidation failed upstream for #{params.canonical_tag}: {text}"
         return out(text, data, params.output)
 
     elif params.action == "plan_merge":
@@ -1525,6 +1522,7 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
             "/api/migration/bootstrap-pg",
             method="POST",
             json_body={"dry_run": params.dry_run, "seed_from_n8n": True},
+            timeout=120.0,
         )
         if not ok:
             return f"Postgres bootstrap failed: {text}"
@@ -1534,19 +1532,19 @@ async def udh_setup(params: SetupIn, ctx: Context) -> str:
         return "This token isn't scoped for udh_setup — needs 'read' (or '*')."
 
     if act == "parity":
-        ok, text, data = await core.dashboard_api("/api/migration/parity")
+        ok, text, data = await core.dashboard_api("/api/migration/parity", timeout=120.0)
         if not ok:
             return f"Shadow parity diff failed: {text}"
         return out(text, data, params.output)
 
     if act == "cutover_check":
-        ok, text, data = await core.dashboard_api("/api/migration/readiness-report")
+        ok, text, data = await core.dashboard_api("/api/migration/readiness-report", timeout=120.0)
         if not ok:
             return f"Stage 4 cutover check failed: {text}"
         return out(text, data, params.output)
 
     if act == "wiring_check":
-        ok, text, data = await core.dashboard_api("/api/self-check/wiring")
+        ok, text, data = await core.dashboard_api("/api/self-check/wiring", timeout=30.0)
         if not ok:
             return f"Site wiring self-check failed: {text}"
         return out(text, data, params.output)

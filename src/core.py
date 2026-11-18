@@ -123,16 +123,19 @@ async def _http_call(method: str, url: str, *, headers: Optional[dict] = None,
                 raise
     import asyncio
     client = _get_pooled_client()
-    for attempt in range(2):
+    is_idempotent = method.upper() in ("GET", "HEAD", "OPTIONS")
+    max_attempts = 2 if is_idempotent else 1
+    for attempt in range(max_attempts):
         try:
             resp = await client.request(method, url, headers=req_headers, json=json_body, timeout=timeout)
-            if resp.status_code in (429, 502, 503, 504) and attempt == 0:
+            if is_idempotent and resp.status_code in (429, 502, 503, 504) and attempt == 0:
                 await asyncio.sleep(0.1)
                 continue
             _record_transport(backend_label, (time.monotonic() - t0) * 1000.0, resp.status_code < 400)
             return resp
         except httpx.TransportError:
-            if attempt == 1:
+            # Never retry non-idempotent POST/mutating requests on TransportError/ReadTimeout
+            if not is_idempotent or attempt + 1 >= max_attempts:
                 _record_transport(backend_label, (time.monotonic() - t0) * 1000.0, False)
                 raise
             await asyncio.sleep(0.1)
@@ -180,16 +183,22 @@ async def dashboard_api(path: str, method: str = "GET",
 # feature).
 DISPATCH_ACTIONS = [
     "publish", "ingest", "reenrich", "resolve_conflict", "rollback",
-    "scan_drift", "confirm_delete", "scrape_url", "release_quarantine",
-    "set_global_pause", "set_target_enabled", "snapshot", "sync_outbound",
-    "backfill_trilium", "propagate_paperless", "reindex_vectors",
-    "update_hub_config", "update_target_config",
+    "saga_rollback", "scan_drift", "confirm_delete", "scrape_url",
+    "release_quarantine", "set_global_pause", "set_target_enabled",
+    "snapshot", "sync_outbound", "backfill_trilium", "propagate_paperless",
+    "reindex_vectors", "update_hub_config", "update_target_config",
     "check_health", "check_integrity", "purge_ingested", "list_templates",
     "create_template", "update_template", "delete_template",
     "set_default_template", "dry_run_pipeline", "create_checkpoint",
     "rollback_checkpoint", "cluster_tags", "get_token_burn",
     "get_target_copy", "adapter_dispatch",
 ]
+LONG_ACTIONS = frozenset({
+    "purge_ingested", "sync_outbound", "ingest", "reenrich", "publish",
+    "backfill_trilium", "reindex_vectors", "rollback", "saga_rollback",
+    "check_health", "check_integrity", "scan_drift", "scrape_url",
+    "propagate_paperless",
+})
 # Actions that restore, overwrite, or destroy existing state rather than
 # move data forward. purge_ingested added 2026-10-13 -- it permanently
 # deletes real documents from a target (matrix-homelab's
@@ -256,12 +265,23 @@ async def _dispatch_n8n(action: str, payload: Optional[dict], timeout: float) ->
     return True, f"Dispatched '{action}': {json.dumps(data, default=str)[:500]}", data
 
 
+def _is_timeout_failure(text: str) -> bool:
+    low = (text or "").lower()
+    return ("timeout" in low or "504" in low or "deadline" in low)
+
+
 async def dispatch(action: str, payload: Optional[dict] = None,
-                    timeout: float = 60.0) -> tuple:
-    """POST one action to native /api/native/dispatch or WF-07 webhook with automatic failover."""
+                    timeout: Optional[float] = None) -> tuple:
+    """POST one action to native /api/native/dispatch or WF-07 webhook with safe failover.
+
+    Long-running actions automatically receive 180s timeout; timeout/504 errors do not
+    blindly replay the mutation onto the secondary backend (preventing duplicate runs).
+    """
+    if timeout is None:
+        timeout = 180.0 if action in LONG_ACTIONS else 60.0
     if _use_native_backend():
         ok, text, data = await _dispatch_native(action, payload, timeout)
-        if ok or (isinstance(data, dict) and data.get("halted")):
+        if ok or (isinstance(data, dict) and data.get("halted")) or _is_timeout_failure(text):
             return ok, text, data
         if WF07_URL and WF07_AUTH_TOKEN:
             fb_ok, fb_text, fb_data = await _dispatch_n8n(action, payload, timeout)
@@ -272,7 +292,7 @@ async def dispatch(action: str, payload: Optional[dict] = None,
         return ok, text, data
 
     ok, text, data = await _dispatch_n8n(action, payload, timeout)
-    if ok or (isinstance(data, dict) and data.get("halted")) or not (WF07_URL and WF07_AUTH_TOKEN):
+    if ok or (isinstance(data, dict) and data.get("halted")) or _is_timeout_failure(text) or not (WF07_URL and WF07_AUTH_TOKEN):
         return ok, text, data
     if UDH_DASHBOARD_URL:
         fb_ok, fb_text, fb_data = await _dispatch_native(action, payload, timeout)
