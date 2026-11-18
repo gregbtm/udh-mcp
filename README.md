@@ -102,7 +102,13 @@ Independent of `synology-proxy-mcp` and `mcphub` by design — see `CLAUDE.md` f
 
 ### Admin / Destructive (`confirm=true` required)
 - `udh_conflicts`: Conflict resolution (`resolve_conflict`).
-- `udh_lifecycle`: Restore/overwrite/destroy operations (`rollback`, `confirm_delete`, `release_quarantine`, `purge_ingested`).
+- `udh_lifecycle`: Restore/overwrite/destroy operations (`rollback`, `confirm_delete`, `release_quarantine`, `purge_ingested` across 9 supported targets with `dry_run=true` preview).
+
+### Manual Migration Workflow (Paused Targets)
+Targets stay paused (`enabled=false`, count `0`) until you intentionally migrate documents per service:
+1. Check live endpoint counts with `udh_dashboard` (e.g., `nas` primary source and `email-fastmail` intake vs `0` elsewhere).
+2. Migrate selected documents to one target without unpausing cron jobs using `udh_sync(operation="sync_outbound", target_id="<target>", doc_ids=[...], confirm=true)` (or **Migrate Docs (Manual)** in `/settings`).
+3. If testing, clear a target safely via `udh_lifecycle(action="purge_ingested", target_id="<target>", dry_run=true)` followed by `dry_run=false, confirm=true`.
 
 ---
 
