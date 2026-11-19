@@ -211,6 +211,13 @@ DESTRUCTIVE_ACTIONS = {"rollback", "confirm_delete", "resolve_conflict",
 # even while hub_config.global_pause is true, so a paused system can still
 # be un-paused and a misbehaving target can still be disabled.
 UNGATED_ACTIONS = {"set_global_pause", "set_target_enabled"}
+# Native-only Python capabilities that n8n WF-07 does not implement; always route directly
+# to udh-dashboard's /api/native/dispatch even while global routing is in 'strangler' mode.
+NATIVE_ONLY_DISPATCH_ACTIONS = frozenset({
+    "create_checkpoint", "rollback_checkpoint", "cluster_tags",
+    "get_token_burn", "dry_run_pipeline", "adapter_dispatch",
+    "hydrate_pg_content",
+})
 
 
 async def _dispatch_native(action: str, payload: Optional[dict], timeout: float) -> tuple:
@@ -274,16 +281,21 @@ async def dispatch(action: str, payload: Optional[dict] = None,
                     timeout: Optional[float] = None) -> tuple:
     """POST one action to native /api/native/dispatch or WF-07 webhook with safe failover.
 
-    Long-running actions automatically receive 180s timeout; timeout/504 errors do not
-    blindly replay the mutation onto the secondary backend (preventing duplicate runs).
+    In 'strangler' harmony mode:
+      - NATIVE_ONLY_DISPATCH_ACTIONS or execute_native=True route directly to Python/Postgres.
+      - Standard workflows route via n8n WF-07 with /api/native/dispatch fallback.
+    Once officially switched to 'native' (_use_native_backend() == True):
+      - All dispatches run on Python/Postgres with n8n WF-07 retained strictly as redundancy failover.
     """
     if timeout is None:
         timeout = 180.0 if action in LONG_ACTIONS else 60.0
-    if _use_native_backend():
+
+    force_native = action in NATIVE_ONLY_DISPATCH_ACTIONS or bool((payload or {}).get("execute_native"))
+    if _use_native_backend() or force_native:
         ok, text, data = await _dispatch_native(action, payload, timeout)
         if ok or (isinstance(data, dict) and data.get("halted")) or _is_timeout_failure(text):
             return ok, text, data
-        if WF07_URL and WF07_AUTH_TOKEN:
+        if action not in NATIVE_ONLY_DISPATCH_ACTIONS and WF07_URL and WF07_AUTH_TOKEN:
             fb_ok, fb_text, fb_data = await _dispatch_n8n(action, payload, timeout)
             if fb_ok and isinstance(fb_data, dict):
                 fb_data["routed_via"] = "n8n_fallback"

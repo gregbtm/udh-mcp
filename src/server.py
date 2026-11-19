@@ -920,8 +920,9 @@ async def udh_checkpoint(params: CheckpointIn, ctx: Context) -> str:
             return out(text_n, data_n, params.output)
         ok, text, data = await dispatch("create_checkpoint", payload)
         if not ok:
-            data = {"ok": False, "persisted": False, "name": params.name, "status": "unavailable", "detail": text}
-            text = f"Checkpoint '{params.name}' could not be persisted upstream ({text})."
+            detail_msg = f"native snapshot: {text_n} | dispatch: {text}"
+            data = {"ok": False, "persisted": False, "name": params.name, "status": "unavailable", "detail": detail_msg}
+            text = f"Checkpoint '{params.name}' could not be persisted upstream ({detail_msg})."
         return out(text, data, params.output)
     
     elif params.action == "restore":
@@ -1650,6 +1651,7 @@ class SchedulerIn(BaseModel):
         description="Stage 2 job ID: wf05a_inbound_sync, wf05b_outbound_sync, wf08_health_digest, wf12_drift_scanner, wf17_vector_reindex, wf20_silent_drift_sweeper.",
     )
     dry_run: bool = Field(True, description="Defaults to True for safe preview. Pass dry_run=false + confirm=true to execute.")
+    execute_native: bool = Field(False, description="When true with action='run', runs the Stage 2 job directly on Native Python even while global routing is 'strangler'.")
     enabled: Optional[bool] = Field(None, description="Required when action='toggle'.")
     confirm: bool = Field(False, description="Required (true) when action='run' with dry_run=false, or action='toggle'.")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
@@ -1704,7 +1706,7 @@ async def udh_scheduler(params: SchedulerIn, ctx: Context) -> str:
         ok, text, data = await core.dashboard_api(
             "/api/stage2/scheduler/run",
             method="POST",
-            json_body={"job_id": params.job_id, "dry_run": params.dry_run},
+            json_body={"job_id": params.job_id, "dry_run": params.dry_run, "execute_native": params.execute_native},
         )
         if not ok:
             return f"Stage 2 scheduler run failed: {text}"

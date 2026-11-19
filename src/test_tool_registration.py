@@ -843,6 +843,24 @@ async def main() -> None:
             check("udh_tokens set_budget posts token_daily_budget to /api/settings/runtime",
                   "Persisted" in await server.udh_tokens(server.TokensIn(action="set_budget", daily_budget=250000), _FakeCtx())
                   and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/settings/runtime")
+
+            # Strangler harmony: native-only dispatch actions bypass WF-07 directly to /api/native/dispatch
+            core.set_runtime_mode(None)
+            core.UDH_BACKEND_MODE = "strangler"
+            core.UDH_PREFER_NATIVE = False
+            ok_chk, _, d_chk = await core.dispatch("create_checkpoint", {"name": "cp-harmony"})
+            check("Harmony strangler: native-only create_checkpoint routes straight to /api/native/dispatch",
+                  ok_chk and d_chk.get("routed_via") == "native"
+                  and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/dispatch")
+
+            # Scheduler execute_native passthrough
+            await server.udh_scheduler(
+                server.SchedulerIn(action="run", job_id="wf12_drift_scanner", dry_run=False, confirm=True, execute_native=True),
+                _FakeCtx(),
+            )
+            check("udh_scheduler forwards execute_native=True to /api/stage2/scheduler/run",
+                  fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/stage2/scheduler/run"
+                  and fake_dlq.calls["posts"][-1][2].get("execute_native") is True)
         finally:
             auth_context_var.reset(sync_dlq)
     finally:
