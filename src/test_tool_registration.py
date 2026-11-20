@@ -949,6 +949,17 @@ async def main() -> None:
                 check("udh_dashboard execute_native queries /api/native/dashboard-data",
                       _json_ctx.loads(r_dash_nat).get("backend") == "native_postgres"
                       and fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/native/dashboard-data")
+
+                # udh_simulate fault injection consistency (notion_rate_limit triggers notion 429 & compensation)
+                r_sim_f = await server.udh_simulate(
+                    server.SimulateIn(scenario="et_witness_statement", target="all", fault="notion_rate_limit", output="json"),
+                    _FakeCtx(),
+                )
+                sim_f_d = _json_ctx.loads(r_sim_f)
+                check("udh_simulate notion_rate_limit injects notion 429 consistently",
+                      sim_f_d["target_results"]["notion"]["status_code"] == 429
+                      and sim_f_d["all_succeeded"] is False
+                      and sim_f_d["compensation_triggered"] is True)
             finally:
                 auth_context_var.reset(read_dash_ctx)
         finally:

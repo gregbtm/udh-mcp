@@ -847,18 +847,25 @@ async def udh_simulate(params: SimulateIn, ctx: Context) -> str:
     simhash_hex = enh.simhash64_blake2b(raw_text)
     
     est_tokens = max(1, int(len(raw_text) / 3.8))
-    target_list = ["docmost", "affine", "paperless", "obsidian", "trilium"] if params.target in ("all", None) else [params.target]
-    
+    target_list = ["docmost", "affine", "paperless", "obsidian", "trilium", "notion"] if params.target in ("all", None) else [params.target]
+
+    _fault_meta = {
+        "notion_rate_limit": (429, "Fault injected: Rate limit"),
+        "obsidian_conflict": (409, "Fault injected: Version conflict"),
+        "affine_network_timeout": (504, "Fault injected: Upstream timeout"),
+    }
     target_results = {}
     for t in target_list:
-        is_fault = bool(params.fault and params.fault.startswith(t))
+        is_fault = bool(params.fault and params.fault != "none" and params.fault.startswith(t))
+        f_code, f_msg = _fault_meta.get(params.fault or "", (429, f"Fault injected: {params.fault}"))
         target_results[t] = {
             "status": "COMPENSATED" if is_fault else "SUCCESS",
-            "status_code": 429 if is_fault else 200,
+            "status_code": f_code if is_fault else 200,
             "latency_ms": 320 if is_fault else 42,
-            "detail": f"Simulated {t} adapter dispatch (" + ("Fault injected: Rate limit" if is_fault else "200 OK") + ")",
+            "detail": f"Simulated {t} adapter dispatch (" + (f_msg if is_fault else "200 OK") + ")",
         }
-    
+
+    any_failed = any(r["status"] != "SUCCESS" for r in target_results.values())
     sim_data = {
         "execution_id": f"sim-{hashlib.sha256(raw_text.encode()).hexdigest()[:8]}",
         "scenario": params.scenario,
@@ -870,8 +877,8 @@ async def udh_simulate(params: SimulateIn, ctx: Context) -> str:
             "estimated_cost_usd": round(est_tokens * 0.0000003, 6),
         },
         "target_results": target_results,
-        "all_succeeded": not any(r["status"] != "SUCCESS" for r in target_results.values()),
-        "compensation_triggered": bool(params.fault and params.fault != "none"),
+        "all_succeeded": not any_failed,
+        "compensation_triggered": any_failed,
     }
     
     target_pairs = ", ".join(f"{k}:{v['status']}" for k, v in target_results.items())
