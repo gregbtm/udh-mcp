@@ -1037,6 +1037,12 @@ async def main() -> None:
                   (not ok_h400) and "Unknown target_id 'ghost'" in txt_h400
                   and isinstance(data_h400, dict) and data_h400.get("halted") is True
                   and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/dispatch")
+
+            # Graceful shutdown timeout prevents hung SSE/HTTP sockets from wedging docker stop
+            import inspect
+            run_src = inspect.getsource(server._run)
+            check("server._run sets timeout_graceful_shutdown for clean container redeploys",
+                  "timeout_graceful_shutdown=" in run_src and "UDH_MCP_GRACEFUL_SHUTDOWN_SECONDS" in run_src)
         finally:
             auth_context_var.reset(sync_dlq)
     finally:

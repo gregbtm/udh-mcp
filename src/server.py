@@ -1986,11 +1986,17 @@ def _run() -> None:
 
     port = int(os.getenv("UDH_MCP_PORT", "8090"))
     host = os.getenv("UDH_MCP_HOST", "0.0.0.0")
-    log.info("Starting udh-mcp on %s:%d", host, port)
+    graceful_timeout = max(1, int(os.getenv("UDH_MCP_GRACEFUL_SHUTDOWN_SECONDS", "3")))
+    log.info("Starting udh-mcp on %s:%d (graceful_shutdown=%ds)", host, port, graceful_timeout)
 
     app = server.streamable_http_app(host=host)
-    config = uvicorn.Config(app, host=host, port=port,
-                            log_level=server.settings.log_level.lower())
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level=server.settings.log_level.lower(),
+        timeout_graceful_shutdown=graceful_timeout,
+    )
     import asyncio
     asyncio.run(uvicorn.Server(config).serve())
 
