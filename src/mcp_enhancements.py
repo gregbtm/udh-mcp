@@ -183,14 +183,47 @@ def repair_mojibake(text: str) -> tuple[str, int]:
     return fixed, hits
 
 
+def _valid_uk_nhs_mod11(digits: str) -> bool:
+    if len(digits) != 10 or len(set(digits)) == 1:
+        return False
+    nums = [int(c) for c in digits]
+    rem = sum(nums[i] * (10 - i) for i in range(9)) % 11
+    chk = 11 - rem
+    if chk == 11:
+        chk = 0
+    return chk != 10 and chk == nums[9]
+
+
 def redact_sensitive_pii(text: str, profile: str = "tribunal_public") -> dict[str, Any]:
     """Deterministic zero-token UK PII scrubber."""
     if profile == "counsel_full":
         return {"text": text, "redactions": {}, "total_redactions": 0, "profile": profile}
     cleaned = text or ""
     counts: dict[str, int] = {}
+
+    nhs_hits = 0
+
+    def _nhs_repl(match: re.Match[str]) -> str:
+        nonlocal nhs_hits
+        raw = match.group(0)
+        start = match.start()
+        prefix = cleaned[max(0, start - 20):start].lower()
+        # Avoid false-redacting invoice/reference/case numbers when unformatted 10-digit ID fails Mod-11
+        has_sep = (" " in raw) or ("-" in raw)
+        has_nhs_ctx = bool(re.search(r"\bnhs\b", prefix))
+        digits = re.sub(r"\D", "", raw)
+        if re.search(r"(?:invoice|inv|order|ref|claim|case|account)\s*#?:?\s*$", prefix) and not has_nhs_ctx:
+            return raw
+        if has_sep or has_nhs_ctx or _valid_uk_nhs_mod11(digits):
+            nhs_hits += 1
+            return "[REDACTED_NHS_NO]"
+        return raw
+
+    cleaned = re.sub(r"\b\d{3}[\s-]?\d{3}[\s-]?\d{4}\b", _nhs_repl, cleaned)
+    if nhs_hits:
+        counts["nhs_number"] = nhs_hits
+
     patterns = (
-        ("nhs_number", r"\b\d{3}[\s-]?\d{3}[\s-]?\d{4}\b", "[REDACTED_NHS_NO]"),
         ("uk_nino", r"\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b", "[REDACTED_NINO]"),
         ("uk_sort_code", r"\b\d{2}-\d{2}-\d{2}\b", "[REDACTED_SORT_CODE]"),
         ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]"),

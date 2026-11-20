@@ -414,12 +414,12 @@ async def _query_n8n(kind: str, params: Optional[dict], timeout: float) -> tuple
 
 
 async def query(kind: str, params: Optional[dict] = None,
-                 timeout: float = 30.0) -> tuple:
+                 timeout: float = 30.0, execute_native: bool = False) -> tuple:
     """POST a query to native /api/native/query or WF-16 with automatic failover."""
     if kind not in QUERY_KINDS:
         return False, f"Unknown query kind '{kind}'. Kinds: {', '.join(QUERY_KINDS)}", None
 
-    if _use_native_backend():
+    if _use_native_backend() or execute_native:
         ok, text, data = await _query_native(kind, params, timeout)
         if ok or (isinstance(data, dict) and data.get("error")):
             return ok, text, data

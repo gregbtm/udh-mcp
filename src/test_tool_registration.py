@@ -909,6 +909,35 @@ async def main() -> None:
                       and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/snapshot/delete")
             finally:
                 auth_context_var.reset(admin_ctx_del)
+
+            # NHS Mod-11 / invoice number guard: skip invoice numbers while catching real NHS numbers
+            inv_clean = enh.redact_sensitive_pii("Do not pay invoice 1800017309 vs valid NHS 9434765919")
+            check("redact_sensitive_pii avoids false-redacting invoice number 1800017309",
+                  "1800017309" in inv_clean["text"] and "[REDACTED_NHS_NO]" in inv_clean["text"] and "9434765919" not in inv_clean["text"])
+
+            # udh_query execute_native & client-side limit trimming
+            read_q_ctx = ctx_with_scopes("read")
+            try:
+                core.set_runtime_mode(None)
+                core.UDH_BACKEND_MODE = "strangler"
+                fake_dlq.post_resp = _Resp(200, {"items": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5}], "count": 5})
+                r_q_lim = await server.udh_query(
+                    server.QueryIn(kind="list_quarantined", limit=2, execute_native=True, output="json"),
+                    _FakeCtx(),
+                )
+                q_lim_d = _json_ctx.loads(r_q_lim)
+                check("udh_query execute_native routes to /api/native/query and trims items to limit",
+                      fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/query"
+                      and len(q_lim_d["items"]) == 2 and q_lim_d.get("truncated_from") == 5)
+            finally:
+                auth_context_var.reset(read_q_ctx)
+
+            # udh_tokens toggle_fallback persists token_fallback_active via /api/settings/runtime
+            fake_dlq.post_resp = _Resp(200, {"ok": True, "token_fallback_active": True})
+            await server.udh_tokens(server.TokensIn(action="toggle_fallback", fallback_active=True, output="json"), _FakeCtx())
+            check("udh_tokens toggle_fallback posts token_fallback_active to /api/settings/runtime",
+                  fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/settings/runtime"
+                  and fake_dlq.calls["posts"][-1][2] == {"token_fallback_active": True})
         finally:
             auth_context_var.reset(sync_dlq)
     finally:

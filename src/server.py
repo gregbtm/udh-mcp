@@ -313,6 +313,7 @@ class QueryIn(BaseModel):
     sensitivity: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
     folder: Optional[str] = Field(None, description="search_fulltext: optional facet filter.")
     sanitize_pii: bool = Field(False, description="get_content/search_fulltext: when true, deterministically scrubs NHS/NINO/email/phone/postcode PII before returning text.")
+    execute_native: bool = Field(False, description="When true, queries Native Postgres (/api/native/query) even while global routing is 'strangler', retaining WF-16 as redundancy fallback.")
 
 
 @server.tool(name="udh_query", title="UDH Document & Conflict Query", annotations=RD)
@@ -366,13 +367,21 @@ async def udh_query(params: QueryIn, ctx: Context) -> str:
         "document_type": params.document_type, "sensitivity": params.sensitivity,
         "folder": params.folder,
     }.items() if v is not None}
-    ok, text, data = await query(params.kind, qparams)
-    if ok and params.sanitize_pii and isinstance(data, dict):
-        if isinstance(data.get("content"), str):
+    ok, text, data = await query(params.kind, qparams, execute_native=params.execute_native)
+    if ok and isinstance(data, dict):
+        changed = False
+        if params.limit > 0:
+            for list_key in ("items", "documents", "operations", "results", "conflicts"):
+                lst = data.get(list_key)
+                if isinstance(lst, list) and len(lst) > params.limit:
+                    data = {**data, list_key: lst[:params.limit], "truncated_from": len(lst), "limit_applied": params.limit}
+                    changed = True
+        if params.sanitize_pii and isinstance(data.get("content"), str):
             red = enh.redact_sensitive_pii(data["content"])
             data = {**data, "content": red["text"], "pii_redactions": red["total_redactions"]}
-            import json as _jq
-            text = _jq.dumps(data, indent=2, default=str)
+            changed = True
+        if changed:
+            text = json.dumps(data, indent=2, default=str)
     return out(text, data, params.output) if ok else text
 
 
@@ -1021,11 +1030,23 @@ async def udh_tokens(params: TokensIn, ctx: Context) -> str:
         return out(text, data, params.output)
     
     elif params.action == "toggle_fallback":
-        mode = "heuristic_fallback" if params.fallback_active else "llm_full"
-        ok_d, text_d, data_d = await dispatch("update_hub_config", {"field": "auto_enrich", "value": not bool(params.fallback_active)})
+        mode = "heuristic" if params.fallback_active else "llm_full"
+        fb_val = bool(params.fallback_active)
+        if core.UDH_DASHBOARD_URL:
+            ok_r, text_r, data_r = await core.dashboard_api(
+                "/api/settings/runtime",
+                method="POST",
+                json_body={"token_fallback_active": fb_val},
+            )
+            if ok_r and isinstance(data_r, dict):
+                return out(f"Adaptive fallback updated: Mode is now '{mode}'.", data_r, params.output)
+        ok_d, text_d, data_d = await dispatch(
+            "update_hub_config",
+            {"field": "auto_enrich", "value": not fb_val, "execute_native": True},
+        )
         if ok_d:
             return out(f"Adaptive fallback updated via hub_config: Mode is now '{mode}'.", data_d, params.output)
-        data = {"ok": False, "is_fallback_active": bool(params.fallback_active), "requested_mode": mode, "persisted": False, "detail": text_d}
+        data = {"ok": False, "is_fallback_active": fb_val, "requested_mode": mode, "persisted": False, "detail": text_d}
         text = f"Adaptive fallback update failed upstream ({text_d}); hub_config was not changed."
         return out(text, data, params.output)
     
