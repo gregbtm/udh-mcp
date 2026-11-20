@@ -938,6 +938,19 @@ async def main() -> None:
             check("udh_tokens toggle_fallback posts token_fallback_active to /api/settings/runtime",
                   fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/settings/runtime"
                   and fake_dlq.calls["posts"][-1][2] == {"token_fallback_active": True})
+
+            # udh_dashboard execute_native fetches /api/native/dashboard-data in strangler mode
+            read_dash_ctx = ctx_with_scopes("read")
+            try:
+                core.set_runtime_mode(None)
+                core.UDH_BACKEND_MODE = "strangler"
+                fake_dlq.get_resp = _Resp(200, {"backend": "native_postgres", "total_documents": 5123})
+                r_dash_nat = await server.udh_dashboard(server.DashboardIn(execute_native=True, output="json"), _FakeCtx())
+                check("udh_dashboard execute_native queries /api/native/dashboard-data",
+                      _json_ctx.loads(r_dash_nat).get("backend") == "native_postgres"
+                      and fake_dlq.calls["gets"][-1][0] == "https://udh-dashboard.test/api/native/dashboard-data")
+            finally:
+                auth_context_var.reset(read_dash_ctx)
         finally:
             auth_context_var.reset(sync_dlq)
     finally:

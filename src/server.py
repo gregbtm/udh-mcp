@@ -264,6 +264,7 @@ async def status(request: Request) -> JSONResponse:
 class DashboardIn(BaseModel):
     model_config = M
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
+    execute_native: bool = Field(False, description="When true, fetches the Native Postgres snapshot (/api/native/dashboard-data) even while global routing is 'strangler'.")
 
 
 @server.tool(name="udh_dashboard", title="UDH Dashboard Snapshot", annotations=RD)
@@ -275,7 +276,7 @@ async def udh_dashboard(params: DashboardIn, ctx: Context) -> str:
     """
     if not _has_scope("read"):
         return "This token isn't scoped for udh_dashboard — needs 'read' (or '*')."
-    ok, text, data = await dashboard_data()
+    ok, text, data = await dashboard_data(execute_native=params.execute_native)
     if not ok:
         return text
     if params.output == "text" and isinstance(data, dict):

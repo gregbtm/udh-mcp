@@ -337,9 +337,9 @@ async def _dashboard_n8n(timeout: float) -> tuple:
     return True, json.dumps(data, indent=2, default=str), data
 
 
-async def dashboard_data(timeout: float = 30.0) -> tuple:
+async def dashboard_data(timeout: float = 30.0, execute_native: bool = False) -> tuple:
     """GET native /api/native/dashboard-data or WF-14 webhook with automatic failover."""
-    if _use_native_backend():
+    if _use_native_backend() or execute_native:
         ok, text, data = await dashboard_api("/api/native/dashboard-data", method="GET", timeout=timeout)
         if ok:
             if isinstance(data, dict):
