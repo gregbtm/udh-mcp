@@ -1029,6 +1029,14 @@ async def main() -> None:
                       len(emp_clusters) == 1 and emp_clusters[0]["canonical"] == "et" and "" not in emp_clusters[0]["variants"])
             finally:
                 auth_context_var.reset(r_emp_t_ctx)
+
+            # 4xx halted response from /api/native/dispatch must NOT trigger n8n_fallback
+            fake_dlq.post_resp = _Resp(400, {"halted": True, "ok": False, "error_code": "UDH-056", "message": "Unknown target_id 'ghost'"})
+            ok_h400, txt_h400, data_h400 = await core.dispatch("check_health", {"target_id": "ghost", "execute_native": True})
+            check("dispatch does not fall back to WF-07 on HTTP 400 native halted error",
+                  (not ok_h400) and "Unknown target_id 'ghost'" in txt_h400
+                  and isinstance(data_h400, dict) and data_h400.get("halted") is True
+                  and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/dispatch")
         finally:
             auth_context_var.reset(sync_dlq)
     finally:

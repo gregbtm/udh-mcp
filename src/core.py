@@ -160,8 +160,17 @@ async def dashboard_api(path: str, method: str = "GET",
         r = await _http_call(method, url, headers=headers,
                              json_body=json_body, timeout=timeout, backend_label="dashboard_api")
         if r.status_code != 200:
+            err_data = None
+            try:
+                parsed_err = r.json() if getattr(r, "content", None) else None
+                if isinstance(parsed_err, dict):
+                    err_data = parsed_err
+            except Exception:
+                err_data = None
             err = enh.map_http_status_to_udh_error(r.status_code, r.text[:300])
-            return False, f"HTTP {r.status_code} ({err['error_code']}): {err['remediation']} | {enh.sanitize_secrets(r.text[:200])}", None
+            msg_hint = (err_data.get("message") or err_data.get("error")) if err_data else ""
+            detail_msg = msg_hint or f"HTTP {r.status_code} ({err['error_code']}): {err['remediation']} | {enh.sanitize_secrets(r.text[:200])}"
+            return False, detail_msg, err_data
         data = r.json() if r.content else {}
     except Exception as e:
         return False, f"{type(e).__name__}: {enh.sanitize_secrets(str(e))}", None
