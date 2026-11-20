@@ -861,6 +861,54 @@ async def main() -> None:
             check("udh_scheduler forwards execute_native=True to /api/stage2/scheduler/run",
                   fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/stage2/scheduler/run"
                   and fake_dlq.calls["posts"][-1][2].get("execute_native") is True)
+
+            # Template normalization: stringified booleans & JSON strings decoded cleanly
+            norm_tmpl = enh.normalize_template_payload({
+                "status": "ok",
+                "rows": [{"template_id": "t1", "is_default": "true", "metadata_fields": '{"title": true}'}],
+                "templates": [{"template_id": "t1", "is_default": "true", "metadata_fields": '{"title": true}'}],
+            })
+            check("normalize_template_payload decodes booleans & JSON and removes duplicate rows key",
+                  "rows" not in norm_tmpl and norm_tmpl["templates"][0]["is_default"] is True
+                  and norm_tmpl["templates"][0]["metadata_fields"] == {"title": True})
+
+            # Legal tag clustering merges Employment Tribunal / ET Case / tribunal
+            read_tag_ctx = ctx_with_scopes("read")
+            try:
+                r_tags_tri = await server.udh_tags(
+                    server.TagsIn(action="cluster_tags", tags=["Employment Tribunal", "ET Case", "tribunal"], output="json"),
+                    _FakeCtx(),
+                )
+            finally:
+                auth_context_var.reset(read_tag_ctx)
+            tri_clusters = _json_ctx.loads(r_tags_tri)["clusters"]
+            check("udh_tags merges Employment Tribunal, ET Case & tribunal into #et",
+                  len(tri_clusters) == 1 and tri_clusters[0]["canonical"] == "et" and len(tri_clusters[0]["variants"]) == 3)
+
+            # udh_health execute_native routes straight to /api/native/dispatch in strangler mode
+            core.set_runtime_mode(None)
+            core.UDH_BACKEND_MODE = "strangler"
+            await server.udh_health(
+                server.HealthIn(action="check_health", confirm=True, execute_native=True),
+                _FakeCtx(),
+            )
+            check("udh_health execute_native=True routes straight to /api/native/dispatch",
+                  fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/dispatch"
+                  and fake_dlq.calls["posts"][-1][2].get("execute_native") is True)
+
+            # udh_checkpoint delete calls /api/native/snapshot/delete under admin+confirm
+            admin_ctx_del = ctx_with_scopes("admin")
+            try:
+                fake_dlq.post_resp = _Resp(200, {"ok": True, "deleted": True, "snapshot_id": "snap-999", "status": "deleted"})
+                r_del_cp = await server.udh_checkpoint(
+                    server.CheckpointIn(action="delete", checkpoint_id="snap-999", confirm=True, output="json"),
+                    _FakeCtx(),
+                )
+                check("udh_checkpoint delete posts snapshot_id to /api/native/snapshot/delete",
+                      _json_ctx.loads(r_del_cp).get("deleted") is True
+                      and fake_dlq.calls["posts"][-1][0] == "https://udh-dashboard.test/api/native/snapshot/delete")
+            finally:
+                auth_context_var.reset(admin_ctx_del)
         finally:
             auth_context_var.reset(sync_dlq)
     finally:

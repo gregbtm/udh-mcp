@@ -100,9 +100,15 @@ _TAG_ALIASES: dict[str, str] = {
     "privileged": "lpp",
     "without-prejudice": "wp",
     "employment-tribunal": "et",
+    "tribunal": "et",
+    "et-case": "et",
+    "uk-tribunal": "et",
     "employment-rights-act": "era-1996",
     "subject-access-request": "dsar",
     "sar": "dsar",
+    "uk-gdpr": "gdpr",
+    "data-protection-act": "dpa",
+    "dpa-2018": "dpa",
     "disaster-recovery": "dr",
     "postgresql": "postgres",
     "dead-letter-queue": "dlq",
@@ -315,6 +321,39 @@ def simhash64_blake2b(text: str) -> str:
 def normalize_canonical_tag_alias(tag: str) -> str:
     slug = re.sub(r"[\s_]+", "-", re.sub(r"^#+", "", (tag or "").strip().lower())).strip("-")
     return _TAG_ALIASES.get(slug, slug)
+
+
+def normalize_template_payload(data: Any) -> Any:
+    """Normalize n8n/native ingestion template rows (booleans, JSON strings, deduped keys)."""
+    import json
+
+    if not isinstance(data, dict):
+        return data
+    raw_list = data.get("templates") if isinstance(data.get("templates"), list) else data.get("rows")
+    if not isinstance(raw_list, list):
+        return data
+
+    normalized: list[Any] = []
+    for row in raw_list:
+        if not isinstance(row, dict):
+            normalized.append(row)
+            continue
+        item = dict(row)
+        if "is_default" in item and isinstance(item["is_default"], str):
+            item["is_default"] = item["is_default"].strip().lower() in ("true", "1", "yes")
+        for jkey in ("metadata_fields", "docling_settings"):
+            val = item.get(jkey)
+            if isinstance(val, str) and val.strip():
+                try:
+                    item[jkey] = json.loads(val)
+                except ValueError:
+                    pass
+        normalized.append(item)
+
+    cleaned = {k: v for k, v in data.items() if k != "rows"}
+    cleaned["templates"] = normalized
+    cleaned["count"] = len(normalized)
+    return cleaned
 
 
 def smart_truncate(text: str, limit: int = 8000) -> str:

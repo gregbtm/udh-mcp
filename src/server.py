@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import functools
 import hmac
+import json
 import logging
 import os
 import time
@@ -573,6 +574,7 @@ class HealthIn(BaseModel):
     action: str = Field(..., description="check_health | check_integrity | wiring_check")
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required.")
+    execute_native: bool = Field(False, description="When true with check_health or check_integrity, runs on Native Python (/api/native/dispatch) even while global routing is 'strangler'.")
     target_id: Optional[str] = Field(None, description="check_health: scope to one target_config row (e.g. 'trilium'). Accepted but NOT YET filtered server-side as of 2026-10-13 -- every target is checked regardless.")
     case_folder: Optional[str] = Field(None, description="check_integrity: scope to one case folder. Accepted but NOT YET filtered server-side as of 2026-10-13 -- the whole registry is checked regardless.")
 
@@ -600,6 +602,8 @@ async def udh_health(params: HealthIn, ctx: Context) -> str:
         payload["target_id"] = params.target_id
     if params.action == "check_integrity" and params.case_folder:
         payload["case_folder"] = params.case_folder
+    if params.execute_native:
+        payload["execute_native"] = True
     if not params.confirm:
         text = f"Would {params.action} with {payload}. Set confirm=true to proceed."
         return out(text, preview("udh_health", resource=params.action, payload=payload), params.output)
@@ -730,6 +734,7 @@ class TemplatesIn(BaseModel):
     target_scope: str = Field("all", description="create_template/update_template: 'all' or a comma-separated target id list -- descriptive only, not enforced (WF-02 enriches once for every target, see docs/udh/26-ingestion-templates-setup.md).")
     metadata_fields: Optional[dict] = Field(None, description="create_template/update_template: which optional CDF frontmatter fields to write, e.g. {'title': true, 'author': true, 'parties': true, 'key_dates': true, 'jurisdiction': true, 'privileged': true, 'physical_location': false, 'custom_fields': ['Court']}. Any key is accepted -- WF-02's 'Build CDF' node is the single source of truth for which keys it actually understands (see matrix-homelab's docs/udh/26-ingestion-templates-setup.md for the current full list).")
     docling_settings: Optional[dict] = Field(None, description="create_template/update_template: Docling extraction options, e.g. {'to_formats': 'md', 'do_table_structure': true}.")
+    execute_native: bool = Field(False, description="When true, executes template reads/writes on Native Python/Postgres (/api/native/dispatch) even while global routing is 'strangler'.")
 
 
 _TEMPLATE_ACTIONS = {"list_templates", "create_template", "update_template",
@@ -767,8 +772,13 @@ async def udh_templates(params: TemplatesIn, ctx: Context) -> str:
 
     payload: dict = {}
     if params.action == "list_templates":
-        ok, text, data = await dispatch("list_templates", {})
-        return out(text, data, params.output) if ok else text
+        if params.execute_native:
+            payload["execute_native"] = True
+        ok, text, data = await dispatch("list_templates", payload)
+        if not ok:
+            return text
+        norm_data = enh.normalize_template_payload(data)
+        return out(json.dumps(norm_data, indent=2, default=str), norm_data, params.output)
 
     if params.action == "delete_template":
         payload = {"template_id": params.template_id, "confirm": True}
@@ -783,6 +793,8 @@ async def udh_templates(params: TemplatesIn, ctx: Context) -> str:
         }
         if params.action == "update_template":
             payload["template_id"] = params.template_id
+    if params.execute_native:
+        payload["execute_native"] = True
 
     if params.action in _TEMPLATE_WRITE_ACTIONS and not params.confirm:
         text = f"Would {params.action} with {payload}. Set confirm=true to proceed."
@@ -937,8 +949,22 @@ async def udh_checkpoint(params: CheckpointIn, ctx: Context) -> str:
         return out(text, data, params.output)
     
     else:  # delete
-        data = {"checkpoint_id": params.checkpoint_id, "status": "deleted"}
-        text = f"Deleted checkpoint '{params.checkpoint_id}'."
+        ok_d, text_d, data_d = await core.dashboard_api(
+            "/api/native/snapshot/delete",
+            method="POST",
+            json_body={"snapshot_id": params.checkpoint_id},
+        )
+        if ok_d and isinstance(data_d, dict) and data_d.get("deleted"):
+            core.invalidate_read_cache()
+            return out(text_d, data_d, params.output)
+        data = {
+            "ok": False,
+            "deleted": False,
+            "checkpoint_id": params.checkpoint_id,
+            "status": "delete_failed",
+            "detail": text_d,
+        }
+        text = f"Failed to delete checkpoint '{params.checkpoint_id}': {text_d}"
         return out(text, data, params.output)
 
 
