@@ -392,7 +392,7 @@ class SyncIn(BaseModel):
     model_config = M
     action: str = Field(..., description=(
         "publish | ingest | reenrich | scan_drift | scrape_url | snapshot | "
-        "sync_outbound | backfill_trilium | propagate_paperless | reindex_vectors"))
+        "sync_outbound | backfill_trilium | propagate_paperless | reindex_vectors | hydrate_pg_content"))
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required for every action here.")
     payload: Optional[dict] = Field(None, description=(
@@ -406,7 +406,7 @@ class SyncIn(BaseModel):
 
 _SYNC_ACTIONS = {"publish", "ingest", "reenrich", "scan_drift", "scrape_url",
                   "snapshot", "sync_outbound", "backfill_trilium",
-                  "propagate_paperless", "reindex_vectors"}
+                  "propagate_paperless", "reindex_vectors", "hydrate_pg_content"}
 
 
 @server.tool(name="udh_sync", title="UDH Sync Operations", annotations=WR)
@@ -442,28 +442,30 @@ class TargetsIn(BaseModel):
     output: str = Field("text", description="'text' or 'json'.", pattern=r"^(text|json)$")
     confirm: bool = Field(False, description="Required.")
     target_id: str = Field(..., description="target_config row id to toggle, e.g. 'trilium'.")
-    direction: str = Field(..., description="'inbound' or 'outbound'.")
+    direction: Optional[str] = Field(None, description="'inbound', 'outbound', or omit for master enabled flag.")
     enabled: bool = Field(..., description="true to enable, false to disable that direction.")
 
 
 @server.tool(name="udh_targets", title="UDH Target Control", annotations=WR)
 @_logged_tool
 async def udh_targets(params: TargetsIn, ctx: Context) -> str:
-    """Enable or disable one direction (inbound/outbound) for one UDH
+    """Enable or disable one direction (inbound/outbound) or the master enabled flag for one UDH
     target, via WF-07's set_target_enabled. Stays reachable even while
     hub_config.global_pause is true (WF-07's own UNGATED_ACTIONS) — a
     caller disabling a misbehaving target shouldn't be blocked by the
     pause that misbehavior may have triggered. No elevated scope needed:
     'sync' covers this, same tier as udh_sync/udh_control.
     """
-    if params.direction not in ("inbound", "outbound"):
-        return "direction must be 'inbound' or 'outbound'."
+    if params.direction is not None and params.direction not in ("inbound", "outbound", "all"):
+        return "direction must be 'inbound', 'outbound', or omitted for master enabled."
     if not _has_scope("sync"):
         return "This token isn't scoped for udh_targets — needs 'sync' (or '*')."
-    payload = {"target_id": params.target_id, "direction": params.direction,
-               "enabled": params.enabled}
+    payload: dict = {"target_id": params.target_id, "enabled": params.enabled}
+    if params.direction in ("inbound", "outbound"):
+        payload["direction"] = params.direction
     if not params.confirm:
-        text = f"Would set {params.target_id}'s {params.direction} to {params.enabled}. Set confirm=true to proceed."
+        dir_label = params.direction or "enabled"
+        text = f"Would set {params.target_id}'s {dir_label} to {params.enabled}. Set confirm=true to proceed."
         return out(text, preview("udh_targets", resource=params.target_id, payload=payload), params.output)
     ok, text, data = await dispatch("set_target_enabled", payload)
     return out(text, data, params.output) if ok else text
@@ -496,7 +498,7 @@ async def udh_conflicts(params: ConflictsIn, ctx: Context) -> str:
                 f"'{params.winner_target_id}', overwriting every other pending "
                 "version. Set confirm=true to proceed.")
         return out(text, preview("udh_conflicts", resource=params.doc_id,
-                   payload=payload, undoable=False), params.output)
+                   scope="admin", payload=payload, undoable=False), params.output)
     ok, text, data = await dispatch("resolve_conflict", payload)
     return out(text, data, params.output) if ok else text
 
@@ -545,7 +547,7 @@ async def udh_lifecycle(params: LifecycleIn, ctx: Context) -> str:
         text = (f"Would {params.action} with {payload}. This restores, overwrites, "
                 f"or destroys existing state. Set confirm=true to proceed.")
         return out(text, preview("udh_lifecycle", resource=params.action,
-                   payload=payload, undoable=False), params.output)
+                   scope="admin", payload=payload, undoable=False), params.output)
     ok, text, data = await dispatch(params.action, payload)
     return out(text, data, params.output) if ok else text
 
@@ -652,6 +654,24 @@ class ConfigIn(BaseModel):
         "hub_config, target_config)."))
 
 
+_ALLOWED_HUB_FIELDS = frozenset({
+    "legal_mode", "global_pause", "dry_run", "auto_enrich", "default_chunk_size",
+    "max_global_batch", "backup_versions_to_keep", "snapshot_keep_count",
+    "quarantine_after_errors", "lock_timeout_seconds", "lock_retry_count",
+    "write_verification", "soft_delete_only", "echo_suppression",
+    "conflict_timeout_hours", "pre_bulk_snapshot", "circuit_breaker_threshold",
+    "default_source_of_truth",
+})
+
+_ALLOWED_TARGET_FIELDS = frozenset({
+    "enabled", "inbound_enabled", "outbound_enabled", "mode", "sync_direction",
+    "endpoint", "credential_ref", "database_id", "source_priority",
+    "conflict_action", "max_batch_size", "write_verification",
+    "circuit_breaker_threshold", "dry_run", "poll_interval_mins",
+    "conflict_timeout_hours", "inbound_workflow_id", "outbound_workflow_id",
+    "blocked_sensitivity_levels",
+})
+
 _CONFIG_ACTIONS = {
     "update_hub_config",
     "update_target_config",
@@ -716,8 +736,13 @@ async def udh_config(params: ConfigIn, ctx: Context) -> str:
 
     if not params.field or params.value is None:
         return f"{params.action} requires both 'field' and 'value'."
-    if params.action == "update_target_config" and not params.target_id:
-        return "update_target_config requires target_id."
+    if params.action == "update_hub_config" and params.field not in _ALLOWED_HUB_FIELDS:
+        return f"Unsupported hub_config field '{params.field}'. Allowed: {', '.join(sorted(_ALLOWED_HUB_FIELDS))}"
+    if params.action == "update_target_config":
+        if not params.target_id:
+            return "update_target_config requires target_id."
+        if params.field not in _ALLOWED_TARGET_FIELDS:
+            return f"Unsupported target_config field '{params.field}'. Allowed: {', '.join(sorted(_ALLOWED_TARGET_FIELDS))}"
 
     payload: dict = {"field": params.field, "value": params.value}
     if params.target_id:
@@ -927,7 +952,7 @@ async def udh_checkpoint(params: CheckpointIn, ctx: Context) -> str:
         if not params.confirm:
             payload = {"action": params.action, "checkpoint_id": params.checkpoint_id}
             text = f"Would {params.action} checkpoint '{params.checkpoint_id}'. Set confirm=true to proceed."
-            return out(text, preview("udh_checkpoint", resource=params.checkpoint_id, payload=payload), params.output)
+            return out(text, preview("udh_checkpoint", resource=params.checkpoint_id, scope="admin", payload=payload), params.output)
     else:
         if not _has_scope("sync"):
             return f"This token isn't scoped for udh_checkpoint action='{params.action}' — needs 'sync' (or '*')."
@@ -1013,8 +1038,11 @@ async def udh_tokens(params: TokensIn, ctx: Context) -> str:
     if not _has_scope(needed):
         return f"This token isn't scoped for udh_tokens action='{params.action}' — needs '{needed}' (or '*')."
     
-    if params.action == "set_budget" and not params.daily_budget:
-        return "set_budget requires daily_budget."
+    if params.action == "set_budget":
+        if params.daily_budget is None:
+            return "set_budget requires daily_budget."
+        if int(params.daily_budget) < 1:
+            return "daily_budget must be >= 1."
     
     if params.action == "get_metrics":
         ok, text, data = await dispatch("get_token_burn", {})
@@ -1099,7 +1127,7 @@ async def udh_tags(params: TagsIn, ctx: Context) -> str:
         if not params.confirm:
             payload = {"canonical": params.canonical_tag, "deprecated": params.deprecated_tags}
             text = f"Would consolidate {len(params.deprecated_tags)} tags into #{params.canonical_tag}. Set confirm=true to proceed."
-            return out(text, preview("udh_tags", resource=params.canonical_tag, payload=payload), params.output)
+            return out(text, preview("udh_tags", resource=params.canonical_tag, scope="admin", payload=payload), params.output)
         
         ok, text, data = await dispatch("cluster_tags", {"action": "consolidate", "canonical": params.canonical_tag, "deprecated": params.deprecated_tags})
         if not ok:
@@ -1125,24 +1153,30 @@ async def udh_tags(params: TagsIn, ctx: Context) -> str:
         if not _has_scope("read"):
             return "cluster_tags requires 'read' (or '*')."
         raw_tags = params.tags or ["invoice", "invoices", "invoice-2026", "billing", "receipts", "receipt", "legal-privilege", "lpp"]
+        cleaned_tags = [str(t).strip() for t in raw_tags if str(t).strip()]
         import difflib
         clusters = []
         visited = set()
-        for t in raw_tags:
+        for t in cleaned_tags:
             if t in visited:
                 continue
             group = [t]
             visited.add(t)
             norm_a = enh.normalize_canonical_tag_alias(t)
-            for other in raw_tags:
+            if not norm_a:
+                continue
+            for other in cleaned_tags:
                 if other in visited:
                     continue
                 norm_b = enh.normalize_canonical_tag_alias(other)
+                if not norm_b:
+                    continue
                 if norm_a == norm_b or difflib.SequenceMatcher(None, norm_a, norm_b).ratio() >= 0.65 or norm_a in norm_b or norm_b in norm_a:
                     group.append(other)
                     visited.add(other)
             if len(group) > 1:
-                canonical = sorted((enh.normalize_canonical_tag_alias(g) for g in group), key=len)[0]
+                candidates = [enh.normalize_canonical_tag_alias(g) for g in group if enh.normalize_canonical_tag_alias(g)]
+                canonical = sorted(candidates, key=len)[0] if candidates else t.lower()
                 clusters.append({
                     "canonical": canonical,
                     "variants": group,

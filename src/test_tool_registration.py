@@ -962,6 +962,73 @@ async def main() -> None:
                       and sim_f_d["compensation_triggered"] is True)
             finally:
                 auth_context_var.reset(read_dash_ctx)
+
+            # Round 1 fixes: udh_config validates invalid fields up front & udh_targets allows optional direction
+            r_bad_cfg = await server.udh_config(
+                server.ConfigIn(action="update_hub_config", field="nonexistent_field", value=True, confirm=True),
+                _FakeCtx(),
+            )
+            check("udh_config rejects unknown hub_config field before calling upstream",
+                  "Unsupported hub_config field" in r_bad_cfg)
+            r_bad_tcfg = await server.udh_config(
+                server.ConfigIn(action="update_target_config", target_id="trilium", field="bad_tgt_field", value=1, confirm=True),
+                _FakeCtx(),
+            )
+            check("udh_config rejects unknown target_config field before calling upstream",
+                  "Unsupported target_config field" in r_bad_tcfg)
+            r_tgt_master = await server.udh_targets(
+                server.TargetsIn(target_id="trilium", enabled=False, confirm=False, output="json"),
+                _FakeCtx(),
+            )
+            check("udh_targets allows omitting direction to preview master enabled toggle",
+                  _json_ctx.loads(r_tgt_master)["payload"] == {"target_id": "trilium", "enabled": False})
+
+            # Rounds 2-5 fixes: hydrate_pg_content in udh_sync, preview scope="admin", budget < 1 guard, empty tag guard
+            r_syn_hyd = await server.udh_sync(
+                server.SyncIn(action="hydrate_pg_content", payload={"dry_run": True}, confirm=False, output="json"),
+                _FakeCtx(),
+            )
+            check("udh_sync accepts hydrate_pg_content action",
+                  _json_ctx.loads(r_syn_hyd)["resource"] == "hydrate_pg_content")
+
+            adm_p = ctx_with_scopes("admin")
+            try:
+                r_cp_prev = await server.udh_checkpoint(
+                    server.CheckpointIn(action="delete", checkpoint_id="snap-1", confirm=False, output="json"),
+                    _FakeCtx(),
+                )
+                r_lf_prev = await server.udh_lifecycle(
+                    server.LifecycleIn(action="purge_ingested", payload={"target_id": "docmost"}, confirm=False, output="json"),
+                    _FakeCtx(),
+                )
+                r_cf_prev = await server.udh_conflicts(
+                    server.ConflictsIn(doc_id="d1", winner_target_id="nas", confirm=False, output="json"),
+                    _FakeCtx(),
+                )
+                r_tg_prev = await server.udh_tags(
+                    server.TagsIn(action="consolidate_tags", canonical_tag="et", deprecated_tags=["ET Case"], confirm=False, output="json"),
+                    _FakeCtx(),
+                )
+                check("admin-gated previews report scope_required='admin'",
+                      all(_json_ctx.loads(x)["scope_required"] == "admin" for x in (r_cp_prev, r_lf_prev, r_cf_prev, r_tg_prev)))
+            finally:
+                auth_context_var.reset(adm_p)
+
+            r_neg_b = await server.udh_tokens(server.TokensIn(action="set_budget", daily_budget=-500), _FakeCtx())
+            check("udh_tokens rejects daily_budget < 1 cleanly before calling upstream",
+                  "daily_budget must be >= 1" in r_neg_b)
+
+            r_emp_t_ctx = ctx_with_scopes("read")
+            try:
+                r_emp_t = await server.udh_tags(
+                    server.TagsIn(action="cluster_tags", tags=["et", "ET", "", "  "], output="json"),
+                    _FakeCtx(),
+                )
+                emp_clusters = _json_ctx.loads(r_emp_t)["clusters"]
+                check("udh_tags skips empty/whitespace tags so canonical is never empty string",
+                      len(emp_clusters) == 1 and emp_clusters[0]["canonical"] == "et" and "" not in emp_clusters[0]["variants"])
+            finally:
+                auth_context_var.reset(r_emp_t_ctx)
         finally:
             auth_context_var.reset(sync_dlq)
     finally:
