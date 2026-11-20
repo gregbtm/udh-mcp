@@ -200,7 +200,7 @@ DISPATCH_ACTIONS = [
     "create_template", "update_template", "delete_template",
     "set_default_template", "dry_run_pipeline", "create_checkpoint",
     "rollback_checkpoint", "cluster_tags", "get_token_burn",
-    "get_target_copy", "adapter_dispatch",
+    "get_target_copy", "adapter_dispatch", "hydrate_pg_content",
 ]
 LONG_ACTIONS = frozenset({
     "purge_ingested", "sync_outbound", "ingest", "reenrich", "publish",
@@ -227,6 +227,19 @@ NATIVE_ONLY_DISPATCH_ACTIONS = frozenset({
     "get_token_burn", "dry_run_pipeline", "adapter_dispatch",
     "hydrate_pg_content",
 })
+_WF07_UNSUPPORTED_TARGET_FIELDS = frozenset({"inbound_enabled", "outbound_enabled", "mode"})
+_WF07_UNSUPPORTED_HUB_FIELDS = frozenset({"legal_mode", "global_pause", "auto_enrich", "default_chunk_size"})
+
+
+def _is_native_only_dispatch(action: str, payload: Optional[dict]) -> bool:
+    if action in NATIVE_ONLY_DISPATCH_ACTIONS:
+        return True
+    p = payload or {}
+    if action == "update_target_config" and str(p.get("field") or "") in _WF07_UNSUPPORTED_TARGET_FIELDS:
+        return True
+    if action == "update_hub_config" and str(p.get("field") or "") in _WF07_UNSUPPORTED_HUB_FIELDS:
+        return True
+    return False
 
 
 async def _dispatch_native(action: str, payload: Optional[dict], timeout: float) -> tuple:
@@ -299,12 +312,13 @@ async def dispatch(action: str, payload: Optional[dict] = None,
     if timeout is None:
         timeout = 180.0 if action in LONG_ACTIONS else 60.0
 
-    force_native = action in NATIVE_ONLY_DISPATCH_ACTIONS or bool((payload or {}).get("execute_native"))
+    native_only = _is_native_only_dispatch(action, payload)
+    force_native = native_only or bool((payload or {}).get("execute_native"))
     if _use_native_backend() or force_native:
         ok, text, data = await _dispatch_native(action, payload, timeout)
         if ok or (isinstance(data, dict) and data.get("halted")) or _is_timeout_failure(text):
             return ok, text, data
-        if action not in NATIVE_ONLY_DISPATCH_ACTIONS and WF07_URL and WF07_AUTH_TOKEN:
+        if not native_only and WF07_URL and WF07_AUTH_TOKEN:
             fb_ok, fb_text, fb_data = await _dispatch_n8n(action, payload, timeout)
             if fb_ok and isinstance(fb_data, dict):
                 fb_data["routed_via"] = "n8n_fallback"

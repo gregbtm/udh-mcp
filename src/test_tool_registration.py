@@ -1043,6 +1043,14 @@ async def main() -> None:
             run_src = inspect.getsource(server._run)
             check("server._run sets timeout_graceful_shutdown for clean container redeploys",
                   "timeout_graceful_shutdown=" in run_src and "UDH_MCP_GRACEFUL_SHUTDOWN_SECONDS" in run_src)
+
+            # Fields missing from WF-07 Route Field route directly to native even in strangler mode
+            fake_dlq.post_resp = _Resp(200, {"status": "ok", "action": "update_target_config", "target_id": "trilium", "field": "inbound_enabled", "value": False})
+            n_before = len(fake_dlq.calls["posts"])
+            ok_tc, _, data_tc = await core.dispatch("update_target_config", {"target_id": "trilium", "field": "inbound_enabled", "value": False})
+            check("update_target_config(inbound_enabled) routes straight to native without wasting 10s on WF-07",
+                  ok_tc and data_tc.get("routed_via") == "native"
+                  and fake_dlq.calls["posts"][n_before][0] == "https://udh-dashboard.test/api/native/dispatch")
         finally:
             auth_context_var.reset(sync_dlq)
     finally:
